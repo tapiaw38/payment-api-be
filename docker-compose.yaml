@@ -1,0 +1,36 @@
+version: "3.7"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: payments-db
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  payments:
+    container_name: payments
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn api.main:app --reload --host 0.0.0.0 --port 8008
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://payments:payments@postgres:5432/payments
+    volumes:
+      - ./src:/app:cached
+    ports:
+      - 8008:8008
+    stdin_open: true
+    tty: true
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data: {}

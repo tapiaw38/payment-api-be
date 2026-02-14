@@ -1,0 +1,1 @@
+MIN_BIN_LENGTH = 6

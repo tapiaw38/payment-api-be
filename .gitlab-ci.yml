@@ -1,0 +1,9 @@
+python-linter:
+  image: python:3.11-buster
+  before_script:
+    - cd src
+    - pip install black==22.3.0
+  script:
+    - black --check --verbose .
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
