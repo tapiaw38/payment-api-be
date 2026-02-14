@@ -6,11 +6,11 @@ This microservice integrates with the MercadoPago API and is mainly used to send
 
 ### **Future Scope**
 
-In the future, this service will fully operate as a **payments microservice** (better aligned with its name), integrating pre-purchase flows (what we currently have for MercadoPago), the purchase flow itself (currently handled by the Bigbox backend in the app **\*\***\*\***\*\***\*\***\*\***\*\***\*\***mercadopago_app**\*\***\*\***\*\***\*\***\*\***\*\***\*\***), and post-purchase flows (updating our database according to what was executed with the corresponding payment gateway API during the purchase process).
+In the future, this service will fully operate as a **payments microservice** (better aligned with its name), integrating pre-purchase flows (what we currently have for MercadoPago), the purchase flow itself (currently handled by the nymia backend in the app **\*\***\*\***\*\***\*\***\*\***\*\***\*\***mercadopago_app**\*\***\*\***\*\***\*\***\*\***\*\***\*\***), and post-purchase flows (updating our database according to what was executed with the corresponding payment gateway API during the purchase process).
 
 ### **Project Wiki**
 
-- <https://wiki.bigbox.com.ar/doc/microservicio-de-pagos-h0DnDfH6ks>
+- <https://wiki.nymia.com.ar/doc/microservicio-de-pagos-h0DnDfH6ks>
 
 ### **Prerequisites**
 
@@ -22,7 +22,7 @@ In the future, this service will fully operate as a **payments microservice** (b
 1. Clone the repository:
 
 ```bash
-git clone git@gitlab.com:bigboxrepo/microservicios/payments.git
+git clone git@gitlab.com:nymiarepo/microservicios/payments.git
 cd payments
 ```
 

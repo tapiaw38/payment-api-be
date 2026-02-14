@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     PROJECT_NAME: str = "payments"
     PROJECT_VERSION: str = "0.1.0"
-    CONTACT: dict[str, str | Any] = {"back_alerts": "sysadmin@bigbox.com.ar"}
+    CONTACT: dict[str, str | Any] = {"back_alerts": "sysadmin@nymia.com.ar"}
     OPEN_API_URL: str = "/docs/openapi.json"
     if ENVIRONMENT != "dev":
         ROOT_PATH = "/payments"
