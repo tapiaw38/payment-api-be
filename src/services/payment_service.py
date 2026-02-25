@@ -129,6 +129,35 @@ class PaymentService:
         self.db.refresh(payment)
         return payment
 
+    def create_preference(self, data) -> dict:
+        from schemas.payments import PreferenceResponse
+        items = [
+            {
+                "title": item.title,
+                "quantity": item.quantity,
+                "unit_price": round(item.unit_price, 2),
+                "currency_id": item.currency_id,
+            }
+            for item in data.items
+        ]
+        back_urls = {
+            "success": data.back_urls.success,
+            "failure": data.back_urls.failure,
+            "pending": data.back_urls.pending,
+        }
+        result = self.mp.create_preference(
+            items=items,
+            payer_email=data.payer_email,
+            external_reference=data.external_reference,
+            back_urls=back_urls,
+            notification_url=data.notification_url,
+        )
+        return {
+            "preference_id": result.get("id", ""),
+            "init_point": result.get("init_point", ""),
+            "sandbox_init_point": result.get("sandbox_init_point", ""),
+        }
+
     def get_payment(self, payment_id: int) -> Payment | None:
         return self.db.query(Payment).filter(Payment.id == payment_id).first()
 

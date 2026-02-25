@@ -8,8 +8,9 @@ from .payment_models import PaymentCreate
 
 
 class MercadopagoPaymentService:
-    def __init__(self, access_token: str):
+    def __init__(self, access_token: str, checkout_pro_access_token: str = ""):
         self.access_token = access_token
+        self.checkout_pro_access_token = checkout_pro_access_token or access_token
         self.base_url = "https://api.mercadopago.com/v1"
 
     def _headers(self, idempotency_key: str | None = None) -> dict[str, str]:
@@ -105,6 +106,37 @@ class MercadopagoPaymentService:
         }
         resp = self._send_request("POST", "/card_tokens", json_body=body)
         return resp["id"]
+
+    def create_preference(self, items: list[dict], payer_email: str, external_reference: str, back_urls: dict, notification_url: str | None = None) -> dict[str, Any]:
+        """Create a Checkout Pro preference. Returns preference with init_point."""
+        body: dict[str, Any] = {
+            "items": items,
+            "payer": {"email": payer_email},
+            "external_reference": external_reference,
+        }
+        # Only add back_urls and auto_return if success URL is a proper public URL
+        success_url = back_urls.get("success", "")
+        if success_url and not success_url.startswith("http://localhost") and "localhost" not in success_url:
+            body["back_urls"] = back_urls
+            body["auto_return"] = "approved"
+        if notification_url:
+            body["notification_url"] = notification_url
+        # Preferences endpoint lives at /checkout/preferences, outside the /v1 prefix
+        # Uses the Checkout Pro access token (different app/credentials from Checkout API)
+        checkout_base = self.base_url.replace("/v1", "")
+        url = f"{checkout_base}/checkout/preferences"
+        idempotency_key = str(uuid.uuid4())
+        headers = {
+            "Authorization": f"Bearer {self.checkout_pro_access_token}",
+            "Content-Type": "application/json",
+            "X-Idempotency-Key": idempotency_key,
+        }
+        import requests as _requests
+        response = _requests.post(url, headers=headers, json=body, timeout=30)
+        if not response.ok:
+            from .exceptions import MercadopagoAPIException
+            raise MercadopagoAPIException(response)
+        return response.json()
 
     def create_card_token_from_saved(self, customer_id: str, card_id: str, security_code: str | None = None) -> str:
         """Create a fresh card token from a saved customer card. Returns token id."""

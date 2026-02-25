@@ -21,4 +21,7 @@ def get_mp_subscription_service() -> MercadopagoSubscriptionService:
 
 
 def get_mp_payment_service() -> MercadopagoPaymentService:
-    return MercadopagoPaymentService(access_token=settings.mercadopago_access_token)
+    return MercadopagoPaymentService(
+        access_token=settings.mercadopago_access_token,
+        checkout_pro_access_token=settings.mercadopago_checkout_pro_access_token,
+    )

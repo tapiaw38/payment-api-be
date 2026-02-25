@@ -21,8 +21,11 @@ class Settings(BaseSettings):
     else:
         ROOT_PATH = ""
 
+    api_key: str = os.environ.get("PAYMENTS_API_KEY", "")
+
     mercadopago_public_key: str = os.environ.get("MP_PUBLIC_KEY_AR", "")
     mercadopago_access_token: str = os.environ.get("MP_ACCESS_TOKEN", "")
+    mercadopago_checkout_pro_access_token: str = os.environ.get("MP_CHECKOUT_PRO_ACCESS_TOKEN", "")
 
     database_url: str = os.environ.get(
         "DATABASE_URL",

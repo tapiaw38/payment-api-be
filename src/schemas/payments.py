@@ -30,6 +30,33 @@ class PaymentWithSavedMethodCreate(BaseModel):
     security_code: str | None = None
 
 
+class PreferenceItem(BaseModel):
+    title: str
+    quantity: int = 1
+    unit_price: float
+    currency_id: str = "ARS"
+
+
+class PreferenceBackUrls(BaseModel):
+    success: str
+    failure: str
+    pending: str
+
+
+class PreferenceCreate(BaseModel):
+    items: list[PreferenceItem]
+    payer_email: str
+    external_reference: str
+    back_urls: PreferenceBackUrls
+    notification_url: str | None = None
+
+
+class PreferenceResponse(BaseModel):
+    preference_id: str
+    init_point: str
+    sandbox_init_point: str
+
+
 class PaymentResponse(BaseModel):
     id: int
     gateway_payment_id: str | None

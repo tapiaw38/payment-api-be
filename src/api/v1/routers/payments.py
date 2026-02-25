@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from api.v1.dependencies.subscriptions import get_db, get_mp_payment_service
 from gateways.mercadopago.exceptions import MercadopagoAPIException
 from gateways.mercadopago.payment_service import MercadopagoPaymentService
-from schemas.payments import PaymentCreate, PaymentResponse, PaymentWithSavedMethodCreate
+from schemas.payments import PaymentCreate, PaymentResponse, PaymentWithSavedMethodCreate, PreferenceCreate, PreferenceResponse
 from services.payment_service import PaymentService
 from sqlalchemy.orm import Session
 
@@ -42,6 +42,20 @@ def create_payment_with_saved_method(
         return payment
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except MercadopagoAPIException as e:
+        raise HTTPException(
+            status_code=e.status_code,
+            detail={"code": e.error_code, "message": e.error_msg},
+        )
+
+
+@router.post("/preferences", response_model=PreferenceResponse)
+def create_preference(
+    data: PreferenceCreate,
+    service: PaymentService = Depends(_service),
+):
+    try:
+        return service.create_preference(data)
     except MercadopagoAPIException as e:
         raise HTTPException(
             status_code=e.status_code,
