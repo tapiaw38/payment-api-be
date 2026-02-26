@@ -98,12 +98,13 @@ class PaymentService:
         self.db.add(payment)
         self.db.flush()
         try:
-            # Create payer object with correct email and customer info
+            # When using a saved customer card token, MP requires payer.type/id
+            # but must NOT receive payment_method_id (it's inferred from the token).
             from gateways.mercadopago.payment_models import PaymentPayer
             payer_info = PaymentPayer(
                 email=payer_email,
                 type="customer",
-                id=payment_method.mp_customer_id
+                id=payment_method.mp_customer_id,
             )
 
             gateway_data = GatewayPaymentCreate(

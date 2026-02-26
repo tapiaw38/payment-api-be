@@ -41,23 +41,33 @@ class MercadopagoPaymentService:
         return response.json()
 
     def create_payment(self, data: PaymentCreate) -> dict[str, Any]:
-        payer_obj = {"email": data.payer.email}
-        if data.payer.id:
-            payer_obj["id"] = data.payer.id
-        if data.payer.type:
-            payer_obj["type"] = data.payer.type
+        # When using a customer card (type="customer" + id), MP expects ONLY type+id in payer,
+        # not email. Including email alongside type+id causes 500 internal_error.
+        if data.payer.type == "customer" and data.payer.id:
+            payer_obj: dict[str, Any] = {"type": "customer", "id": data.payer.id}
+        else:
+            payer_obj = {"email": data.payer.email}
+            if data.payer.id:
+                payer_obj["id"] = data.payer.id
+            if data.payer.type:
+                payer_obj["type"] = data.payer.type
 
-        body = {
+        body: dict[str, Any] = {
             "transaction_amount": data.transaction_amount,
             "token": data.token,
-            "payment_method_id": data.payment_method_id,
             "payer": payer_obj,
             "installments": data.installments,
         }
+        # MP infers payment_method_id from the token when using customer cards;
+        # sending it alongside payer.type="customer" causes 500 internal_error.
+        if data.payer.type != "customer":
+            body["payment_method_id"] = data.payment_method_id
         if data.description:
             body["description"] = data.description
         if data.external_reference:
             body["external_reference"] = data.external_reference
+        import json as _json
+        print(f"[DEBUG] MP /payments request body: {_json.dumps(body)}", flush=True)
         return self._send_request("POST", "/payments", json_body=body, idempotency_key=str(uuid.uuid4()))
 
     def get_payment(self, payment_id: int | str) -> dict[str, Any]:
