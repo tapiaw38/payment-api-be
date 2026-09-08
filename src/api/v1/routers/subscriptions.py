@@ -1,9 +1,18 @@
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.v1.dependencies.subscriptions import get_db, get_mp_subscription_service
+from config.settings import settings
 from gateways.mercadopago.exceptions import MercadopagoAPIException
 from gateways.mercadopago.subscriptions_service import MercadopagoSubscriptionService
-from schemas.subscriptions import PlanCreate, PlanResponse, SubscriptionCreate, SubscriptionResponse
+from schemas.subscriptions import (
+    BillingCycleCreate,
+    BillingCycleResponse,
+    EntitlementResponse,
+    PlanCreate,
+    PlanResponse,
+    SubscriptionCreate,
+    SubscriptionResponse,
+)
 from services.subscription_service import SubscriptionService
 from sqlalchemy.orm import Session
 
@@ -14,7 +23,11 @@ def _service(
     db: Session = Depends(get_db),
     mp: MercadopagoSubscriptionService = Depends(get_mp_subscription_service),
 ) -> SubscriptionService:
-    return SubscriptionService(db=db, mp_subscription=mp)
+    return SubscriptionService(
+        db=db,
+        mp_subscription=mp,
+        webhook_url=settings.mercadopago_subscription_webhook_url,
+    )
 
 
 @router.get("/plans", response_model=list[PlanResponse])
@@ -81,6 +94,20 @@ def list_subscriptions_by_user(
     return service.get_subscription_by_user(user_id)
 
 
+@router.get("/subscriptions/user/{user_id}/entitlement", response_model=EntitlementResponse)
+def get_entitlement(user_id: str, service: SubscriptionService = Depends(_service)):
+    subscription = service.get_entitlement(user_id)
+    if not subscription:
+        return EntitlementResponse(user_id=user_id, active=False)
+    return EntitlementResponse(
+        user_id=user_id,
+        active=True,
+        subscription_id=subscription.id,
+        plan_id=subscription.plan_id,
+        access_until=subscription.current_period_end,
+    )
+
+
 @router.post("/subscriptions/{subscription_id}/cancel")
 def cancel_subscription(
     subscription_id: int,
@@ -94,3 +121,35 @@ def cancel_subscription(
         return {"status": sub.status}
     except MercadopagoAPIException as e:
         raise HTTPException(status_code=e.status_code, detail={"code": e.error_code, "message": e.error_msg})
+
+
+@router.post("/subscriptions/{subscription_id}/billing-cycles", response_model=BillingCycleResponse)
+def create_billing_cycle(
+    subscription_id: int,
+    data: BillingCycleCreate,
+    service: SubscriptionService = Depends(_service),
+):
+    try:
+        return service.create_billing_cycle(subscription_id, data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e.args[0]))
+
+
+@router.post("/subscriptions/billing-cycles/{cycle_id}/schedule", response_model=BillingCycleResponse)
+def schedule_billing_cycle(
+    cycle_id: int,
+    service: SubscriptionService = Depends(_service),
+):
+    try:
+        cycle = service.update_next_charge_amount(cycle_id)
+        if not cycle:
+            raise HTTPException(status_code=404, detail="billing_cycle_not_found")
+        return cycle
+    except MercadopagoAPIException as e:
+        raise HTTPException(status_code=e.status_code, detail={"code": e.error_code, "message": e.error_msg})
+
+
+@router.post("/subscriptions/reconcile-cancellations")
+def reconcile_cancellations(service: SubscriptionService = Depends(_service)):
+    """Internal scheduled-job endpoint; protected by the service API key."""
+    return {"cancelled": [sub.id for sub in service.cancel_due_subscriptions()]}

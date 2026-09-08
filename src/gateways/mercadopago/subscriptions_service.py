@@ -81,8 +81,23 @@ class MercadopagoSubscriptionService:
     def get_subscription(self, preapproval_id: str) -> dict[str, Any]:
         return self._send_request("GET", f"/preapproval/{preapproval_id}")
 
+    def get_authorized_payment(self, authorized_payment_id: str) -> dict[str, Any]:
+        return self._send_request("GET", f"/authorized_payments/{authorized_payment_id}")
+
+    def update_subscription_amount(
+        self,
+        preapproval_id: str,
+        amount: float,
+        currency: str = "ARS",
+    ) -> dict[str, Any]:
+        return self._send_request(
+            "PUT",
+            f"/preapproval/{preapproval_id}",
+            json_body={"auto_recurring": {"transaction_amount": amount, "currency_id": currency}},
+        )
+
     def cancel_subscription(self, preapproval_id: str) -> dict[str, Any]:
-        return self._send_request("PUT", f"/preapproval/{preapproval_id}", json_body={"status": "cancelled"})
+        return self._send_request("PUT", f"/preapproval/{preapproval_id}", json_body={"status": "canceled"})
 
     def pause_subscription(self, preapproval_id: str) -> dict[str, Any]:
         return self._send_request("PUT", f"/preapproval/{preapproval_id}", json_body={"status": "paused"})

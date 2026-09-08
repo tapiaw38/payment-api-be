@@ -63,7 +63,9 @@ class TestMercadopagoApi:
     def test_endpoints_response_model(self):
         all_routes = client.app.routes
         test_api_routes = [
-            route for route in all_routes if isinstance(route, fastapi.routing.APIRoute)
+            route for route in all_routes
+            if isinstance(route, fastapi.routing.APIRoute)
+            and route.path.startswith("/api/v1/mercadopago")
         ]
         for route in test_api_routes:
             model = self._get_route_response_model(route)

@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Enum as SQLEnum
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from .session import Base
@@ -11,7 +11,7 @@ class Plan(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(255), nullable=False)
     description = Column(String(500), nullable=True)
-    amount = Column(Float, nullable=False)
+    amount = Column(Numeric(14, 2), nullable=False)
     currency = Column(String(3), default="ARS")
     interval = Column(String(20), nullable=False)
     interval_count = Column(Integer, default=1)
@@ -37,6 +37,7 @@ class Subscription(Base):
     current_period_end = Column(DateTime, nullable=True)
     cancel_at_period_end = Column(Integer, default=0)
     cancelled_at = Column(DateTime, nullable=True)
+    next_payment_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -49,7 +50,7 @@ class Payment(Base):
     id = Column(Integer, primary_key=True, index=True)
     gateway = Column(String(50), nullable=False, default="mercadopago")
     gateway_payment_id = Column(String(255), nullable=True, index=True)
-    amount = Column(Float, nullable=False)
+    amount = Column(Numeric(14, 2), nullable=False)
     currency = Column(String(3), default="ARS")
     status = Column(String(50), nullable=False, index=True)
     user_id = Column(String(255), nullable=True, index=True)
@@ -76,3 +77,43 @@ class PaymentMethod(Base):
     is_default = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class BillingCycle(Base):
+    """Immutable usage snapshot used to explain every recurring charge."""
+
+    __tablename__ = "billing_cycles"
+    __table_args__ = (UniqueConstraint("subscription_id", "period_start", name="uq_billing_cycle_period"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=False, index=True)
+    period_start = Column(DateTime, nullable=False)
+    period_end = Column(DateTime, nullable=False)
+    active_seats = Column(Integer, nullable=False)
+    unit_amount = Column(Numeric(14, 2), nullable=False)
+    minimum_amount = Column(Numeric(14, 2), nullable=False)
+    amount = Column(Numeric(14, 2), nullable=False)
+    currency = Column(String(3), nullable=False, default="ARS")
+    status = Column(String(50), nullable=False, default="pending", index=True)
+    gateway_authorized_payment_id = Column(String(255), nullable=True, unique=True, index=True)
+    gateway_payment_id = Column(String(255), nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    subscription = relationship("Subscription")
+
+
+class WebhookEvent(Base):
+    """Provider delivery log. gateway_event_id makes retries idempotent."""
+
+    __tablename__ = "webhook_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    gateway = Column(String(50), nullable=False)
+    gateway_event_id = Column(String(255), nullable=False, unique=True, index=True)
+    topic = Column(String(100), nullable=False)
+    resource_id = Column(String(255), nullable=False)
+    payload = Column(Text, nullable=False)
+    status = Column(String(30), nullable=False, default="received", index=True)
+    processed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

@@ -59,14 +59,25 @@ The API will be available at **`http://localhost:8008`**.
 
 - `MP_PUBLIC_KEY_AR`: MercadoPago public key (pre-purchase / checkout).
 - `MP_ACCESS_TOKEN`: MercadoPago access token (subscriptions and webhooks).
+- `MP_WEBHOOK_SECRET`: Secret from MercadoPago Webhooks. Required to receive notifications; unsigned notifications are rejected.
 - `DATABASE_URL`: PostgreSQL connection (e.g. `postgresql://payments:payments@localhost:5432/payments`). The default is used if not defined.
 
 ### **API Endpoints**
 
 - **MercadoPago** (pre-purchase): `/api/v1/mercadopago/` — payment_methods, installments, identification_types, token.
 - **Payments (one-time charge)**: `/api/v1/payments/` — POST create payment (token, amount, payment method, payer), GET payment by id.
-- **Subscriptions**: `/api/v1/subscriptions/` — plans (list, create, retrieve), subscriptions (create, retrieve, list by user, cancel).
-- **Webhooks**: `/api/v1/webhooks/mercadopago` — POST endpoint for MercadoPago notifications (payments and subscriptions).
+- **Subscriptions**: `/api/v1/subscriptions/` — plans, subscriptions, monthly billing cycles and deferred cancellation reconciliation.
+- **Webhooks**: `/api/v1/webhooks/mercadopago` — signed MercadoPago notifications. Delivery IDs are persisted to make retries idempotent.
+
+### Recurring billing
+
+A `Plan` defines catalog pricing. A `BillingCycle` records immutable monthly usage: active students, unit price, minimum price and final amount. Create the cycle before the next charge, then call `POST /subscriptions/billing-cycles/{cycle_id}/schedule`; this updates only that teacher's MercadoPago `preapproval` amount. Never change a shared plan to reflect one teacher's student count.
+
+Set `MP_SUBSCRIPTION_WEBHOOK_URL` to this service's public HTTPS endpoint. It is sent to MercadoPago for every subscription; caller-supplied notification URLs are ignored.
+
+Run `python -m jobs.reconcile_cancellations` daily from Cron, Kubernetes CronJob or systemd timer. Equivalent protected endpoint: `POST /subscriptions/reconcile-cancellations`. It cancels subscriptions previously marked `at_period_end` only after their paid period expires.
+
+The academic backend can ask `GET /subscriptions/subscriptions/user/{user_id}/entitlement` before granting paid features. This is service-to-service API, protected by `PAYMENTS_API_KEY` in production.
 
 Endpoints for a combination of **version** and **module** can be found at `/{version}/{module}/`, for example: `/v1/mercadopago/`, `/v1/subscriptions/`.
 

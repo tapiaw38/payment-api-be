@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     mercadopago_public_key: str = os.environ.get("MP_PUBLIC_KEY_AR", "")
     mercadopago_access_token: str = os.environ.get("MP_ACCESS_TOKEN", "")
     mercadopago_checkout_pro_access_token: str = os.environ.get("MP_CHECKOUT_PRO_ACCESS_TOKEN", "")
+    # Secret generated in Mercado Pago > Your integrations > Webhooks.
+    # Webhook processing is intentionally disabled when this is absent.
+    mercadopago_webhook_secret: str = os.environ.get("MP_WEBHOOK_SECRET", "")
+    # Subscription notifications must target this service, never a URL supplied
+    # by a browser/client request.
+    mercadopago_subscription_webhook_url: str = os.environ.get("MP_SUBSCRIPTION_WEBHOOK_URL", "")
 
     database_url: str = os.environ.get(
         "DATABASE_URL",
