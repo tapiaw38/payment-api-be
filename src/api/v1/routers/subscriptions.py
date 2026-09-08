@@ -10,6 +10,7 @@ from schemas.subscriptions import (
     EntitlementResponse,
     PlanCreate,
     PlanResponse,
+    PlanUpdate,
     SubscriptionCreate,
     SubscriptionResponse,
 )
@@ -65,6 +66,27 @@ def get_plan(
     return plan
 
 
+@router.put("/plans/{plan_id}", response_model=PlanResponse)
+def update_plan(
+    plan_id: int,
+    payload: PlanUpdate,
+    service: SubscriptionService = Depends(_service),
+):
+    plan = service.update_plan(plan_id, payload)
+    if not plan:
+        raise HTTPException(status_code=404, detail="plan_not_found")
+    return plan
+
+
+@router.delete("/plans/{plan_id}", response_model=PlanResponse)
+def deactivate_plan(plan_id: int, service: SubscriptionService = Depends(_service)):
+    """Takes the plan off the shelf. Subscriptions to it keep working."""
+    plan = service.deactivate_plan(plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="plan_not_found")
+    return plan
+
+
 @router.post("/subscriptions", response_model=SubscriptionResponse)
 def create_subscription(
     data: SubscriptionCreate,
@@ -111,6 +133,30 @@ def get_entitlement(user_id: str, service: SubscriptionService = Depends(_servic
         access_until=subscription.current_period_end,
         metadata=(subscription.plan.plan_metadata if subscription.plan else None) or {},
     )
+
+
+@router.post("/subscriptions/{subscription_id}/pause", response_model=SubscriptionResponse)
+def pause_subscription(subscription_id: int, service: SubscriptionService = Depends(_service)):
+    try:
+        subscription = service.pause_subscription(subscription_id)
+    except MercadopagoAPIException as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    if not subscription:
+        raise HTTPException(status_code=404, detail="subscription_not_found")
+    return subscription
+
+
+@router.post("/subscriptions/{subscription_id}/resume", response_model=SubscriptionResponse)
+def resume_subscription(subscription_id: int, service: SubscriptionService = Depends(_service)):
+    try:
+        subscription = service.resume_subscription(subscription_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except MercadopagoAPIException as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    if not subscription:
+        raise HTTPException(status_code=404, detail="subscription_not_found")
+    return subscription
 
 
 @router.post("/subscriptions/{subscription_id}/cancel")

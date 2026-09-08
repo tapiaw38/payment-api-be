@@ -32,6 +32,17 @@ class PlanCreate(BaseModel):
     metadata: dict[str, Any] = {}
 
 
+class PlanUpdate(BaseModel):
+    """Every field optional: a caller edits what it names and nothing else."""
+
+    name: str | None = None
+    description: str | None = None
+    amount: float | None = None
+    currency: str | None = None
+    metadata: dict[str, Any] | None = None
+    active: bool | None = None
+
+
 class PlanResponse(BaseModel):
     id: int
     name: str

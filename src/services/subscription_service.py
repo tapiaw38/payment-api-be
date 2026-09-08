@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from db.models import BillingCycle, Plan, Subscription
 from gateways.mercadopago.exceptions import MercadopagoAPIException
 from gateways.mercadopago.subscriptions_service import MercadopagoSubscriptionService
-from schemas.subscriptions import BillingCycleCreate, PlanCreate, SubscriptionCreate
+from schemas.subscriptions import BillingCycleCreate, PlanCreate, PlanUpdate, SubscriptionCreate
 
 
 class SubscriptionService:
@@ -158,6 +158,94 @@ class SubscriptionService:
             .order_by(Subscription.current_period_end.desc().nullslast(), Subscription.created_at.desc())
             .first()
         )
+
+    def update_plan(self, plan_id: int, data: PlanUpdate) -> Plan | None:
+        """Edits a plan.
+
+        Only what new subscribers will be charged. Everyone already subscribed
+        holds their own agreement at the amount they accepted, and moving them
+        is a separate, deliberate act — a price rise that applied itself to
+        existing payers without asking is a chargeback, not a feature.
+        """
+        plan = self.get_plan(plan_id)
+        if not plan:
+            return None
+
+        if plan.gateway_plan_id and (data.name is not None or data.amount is not None):
+            try:
+                self.mp.update_plan(
+                    preapproval_plan_id=plan.gateway_plan_id,
+                    reason=data.name,
+                    amount=data.amount,
+                    currency=data.currency or plan.currency,
+                )
+            except MercadopagoAPIException:
+                self.db.rollback()
+                raise
+
+        for field in ("name", "description", "amount", "currency"):
+            value = getattr(data, field)
+            if value is not None:
+                setattr(plan, field, value)
+        if data.metadata is not None:
+            plan.plan_metadata = data.metadata
+        if data.active is not None:
+            plan.active = 1 if data.active else 0
+
+        self.db.commit()
+        self.db.refresh(plan)
+        return plan
+
+    def deactivate_plan(self, plan_id: int) -> Plan | None:
+        """Takes a plan off the shelf without deleting it.
+
+        Subscriptions point at their plan, and people keep paying for what they
+        bought after it stops being sold. Deleting the row would leave those
+        subscriptions describing a plan that no longer exists.
+        """
+        plan = self.get_plan(plan_id)
+        if not plan:
+            return None
+        plan.active = 0
+        self.db.commit()
+        self.db.refresh(plan)
+        return plan
+
+    def pause_subscription(self, subscription_id: int) -> Subscription | None:
+        sub = self.get_subscription(subscription_id)
+        if not sub or not sub.gateway_subscription_id:
+            return None
+        try:
+            self.mp.pause_subscription(sub.gateway_subscription_id)
+        except MercadopagoAPIException:
+            self.db.rollback()
+            raise
+        sub.status = "paused"
+        self.db.commit()
+        self.db.refresh(sub)
+        return sub
+
+    def resume_subscription(self, subscription_id: int) -> Subscription | None:
+        """Puts a paused subscription back to work.
+
+        Only paused ones. A cancelled agreement cannot be revived at the
+        gateway: the payer authorised a charge and then withdrew it, and the
+        only way back is for them to authorise a new one.
+        """
+        sub = self.get_subscription(subscription_id)
+        if not sub or not sub.gateway_subscription_id:
+            return None
+        if sub.status != "paused":
+            raise ValueError("subscription_not_paused")
+        try:
+            self.mp.resume_subscription(sub.gateway_subscription_id)
+        except MercadopagoAPIException:
+            self.db.rollback()
+            raise
+        sub.status = "authorized"
+        self.db.commit()
+        self.db.refresh(sub)
+        return sub
 
     def cancel_subscription(self, subscription_id: int, at_period_end: bool = False) -> Subscription | None:
         sub = self.get_subscription(subscription_id)

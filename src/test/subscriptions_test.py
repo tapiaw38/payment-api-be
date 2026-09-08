@@ -147,3 +147,74 @@ def test_a_product_cannot_read_another_products_rows():
         assert practiq.get_subscription(yego_subscription_id) is None
     finally:
         db.close()
+
+
+class RecordingMercadoPago:
+    """Records what was asked of the gateway, so a test can assert the call."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
+    def pause_subscription(self, preapproval_id: str) -> dict:
+        self.calls.append(("pause", preapproval_id))
+        return {"status": "paused"}
+
+    def resume_subscription(self, preapproval_id: str) -> dict:
+        self.calls.append(("resume", preapproval_id))
+        return {"status": "authorized"}
+
+
+def _subscription_db(status: str):
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    plan = Plan(tenant="practiq", name="Equipo", amount=Decimal("25000"), interval="month")
+    db.add(plan)
+    db.flush()
+    db.add(
+        Subscription(
+            tenant="practiq",
+            plan_id=plan.id,
+            user_id="teacher-1",
+            status=status,
+            gateway_subscription_id="preapproval-1",
+        )
+    )
+    db.commit()
+    return db
+
+
+def test_pausing_stops_charges_and_can_be_undone():
+    db = _subscription_db("authorized")
+    mp = RecordingMercadoPago()
+    service = SubscriptionService(db, mp, tenant="practiq")
+    subscription_id = service.get_entitlement("teacher-1").id
+    try:
+        assert service.pause_subscription(subscription_id).status == "paused"
+        assert service.resume_subscription(subscription_id).status == "authorized"
+        assert mp.calls == [("pause", "preapproval-1"), ("resume", "preapproval-1")]
+    finally:
+        db.close()
+
+
+def test_a_cancelled_subscription_cannot_be_resumed():
+    """Cancelling withdraws the payer's authorisation at the gateway.
+
+    Offering resume on a cancelled subscription would promise something only
+    the payer's card details can deliver, which is exactly why the product
+    offers pausing before it offers cancelling.
+    """
+    db = _subscription_db("cancelled")
+    mp = RecordingMercadoPago()
+    service = SubscriptionService(db, mp, tenant="practiq")
+    subscription = db.query(Subscription).first()
+    try:
+        raised = False
+        try:
+            service.resume_subscription(subscription.id)
+        except ValueError as exc:
+            raised = str(exc) == "subscription_not_paused"
+        assert raised, "resuming a cancelled subscription must be refused"
+        assert mp.calls == [], "the gateway must not be called at all"
+    finally:
+        db.close()

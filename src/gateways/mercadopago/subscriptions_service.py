@@ -56,6 +56,26 @@ class MercadopagoSubscriptionService:
         }
         return self._send_request("POST", "/preapproval_plan", json_body=body)
 
+    def update_plan(
+        self,
+        preapproval_plan_id: str,
+        reason: str | None = None,
+        amount: float | None = None,
+        currency: str = "ARS",
+    ) -> dict[str, Any]:
+        """Edits the published plan.
+
+        This changes what new subscribers are charged. People already
+        subscribed hold their own preapproval with its own amount and keep
+        paying it until that subscription is updated too.
+        """
+        body: dict[str, Any] = {}
+        if reason is not None:
+            body["reason"] = reason
+        if amount is not None:
+            body["auto_recurring"] = {"transaction_amount": amount, "currency_id": currency}
+        return self._send_request("PUT", f"/preapproval_plan/{preapproval_plan_id}", json_body=body)
+
     def create_subscription(
         self,
         preapproval_plan_id: str,
@@ -100,4 +120,12 @@ class MercadopagoSubscriptionService:
         return self._send_request("PUT", f"/preapproval/{preapproval_id}", json_body={"status": "canceled"})
 
     def pause_subscription(self, preapproval_id: str) -> dict[str, Any]:
+        """Stops charging without ending the agreement.
+
+        Unlike cancelling, this can be undone: the payer keeps their
+        authorisation and resume_subscription puts it back to work.
+        """
         return self._send_request("PUT", f"/preapproval/{preapproval_id}", json_body={"status": "paused"})
+
+    def resume_subscription(self, preapproval_id: str) -> dict[str, Any]:
+        return self._send_request("PUT", f"/preapproval/{preapproval_id}", json_body={"status": "authorized"})
