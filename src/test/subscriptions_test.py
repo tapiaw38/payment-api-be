@@ -9,7 +9,8 @@ from api.v1.routers.webhooks import _validate_signature
 from config.settings import settings
 from db.models import Plan, Subscription
 from db.session import Base
-from schemas.subscriptions import BillingCycleCreate, PlanCreate, PlanResponse
+from gateways.mercadopago.exceptions import MercadopagoAPIException
+from schemas.subscriptions import BillingCycleCreate, PlanCreate, PlanResponse, SubscriptionCreate
 from services.subscription_service import SubscriptionService
 
 
@@ -267,5 +268,119 @@ def test_a_plan_is_refused_when_no_back_url_is_configured():
             raised = str(exc) == "back_url_not_configured"
         assert raised
         assert mp.body == {}, "the gateway must not be called at all"
+    finally:
+        db.close()
+
+
+class _DeclinedResponse:
+    """The exception reads the gateway's response, so a test needs one."""
+
+    status_code = 400
+    text = "card declined"
+
+    def json(self):
+        return {"message": "card declined", "code": "declined"}
+
+
+class SwitchRecordingMercadoPago:
+    def __init__(self, fail_create=False):
+        self.cancelled: list[str] = []
+        self.created = 0
+        self.fail_create = fail_create
+
+    def cancel_subscription(self, preapproval_id: str) -> dict:
+        self.cancelled.append(preapproval_id)
+        return {"status": "cancelled"}
+
+    def create_subscription(self, **kwargs) -> dict:
+        if self.fail_create:
+            raise MercadopagoAPIException(_DeclinedResponse())
+        self.created += 1
+        return {"id": "preapproval-new", "status": "authorized"}
+
+
+def _two_plan_db():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    for name, gw in (("Solo", "gw-solo"), ("Equipo", "gw-equipo")):
+        db.add(Plan(tenant="practiq", name=name, amount=Decimal("25000"), interval="month", gateway_plan_id=gw))
+    db.flush()
+    first = db.query(Plan).order_by(Plan.id).first()
+    db.add(
+        Subscription(
+            tenant="practiq",
+            plan_id=first.id,
+            user_id="teacher-1",
+            status="authorized",
+            gateway_subscription_id="preapproval-old",
+        )
+    )
+    db.commit()
+    return db
+
+
+def test_changing_plan_cancels_the_previous_agreement():
+    """Two live agreements at the gateway means the payer is charged twice."""
+    db = _two_plan_db()
+    mp = SwitchRecordingMercadoPago()
+    service = SubscriptionService(db, mp, webhook_url="https://hook", tenant="practiq")
+    target = db.query(Plan).order_by(Plan.id.desc()).first()
+    try:
+        service.create_subscription(
+            SubscriptionCreate(
+                plan_id=target.id, user_id="teacher-1", payer_email="t@example.com", card_token_id="tok"
+            )
+        )
+        assert mp.cancelled == ["preapproval-old"], "the old agreement must be cancelled"
+        live = [s for s in db.query(Subscription).all() if s.status in SubscriptionService.LIVE_STATUSES]
+        assert len(live) == 1, f"exactly one live subscription, got {len(live)}"
+        assert live[0].plan_id == target.id
+    finally:
+        db.close()
+
+
+def test_a_declined_card_leaves_no_subscription_rather_than_two():
+    """The old one is cancelled first, so a failure costs access, not money."""
+    db = _two_plan_db()
+    mp = SwitchRecordingMercadoPago(fail_create=True)
+    service = SubscriptionService(db, mp, webhook_url="https://hook", tenant="practiq")
+    target = db.query(Plan).order_by(Plan.id.desc()).first()
+    try:
+        raised = False
+        try:
+            service.create_subscription(
+                SubscriptionCreate(
+                    plan_id=target.id, user_id="teacher-1", payer_email="t@example.com", card_token_id="tok"
+                )
+            )
+        except MercadopagoAPIException:
+            raised = True
+        assert raised
+        live = [s for s in db.query(Subscription).all() if s.status in SubscriptionService.LIVE_STATUSES]
+        assert len(live) == 0, "no agreement may survive a failed switch"
+    finally:
+        db.close()
+
+
+def test_subscribing_again_to_the_same_plan_is_refused():
+    """Otherwise a double click cancels a working subscription and rebuys it."""
+    db = _two_plan_db()
+    mp = SwitchRecordingMercadoPago()
+    service = SubscriptionService(db, mp, webhook_url="https://hook", tenant="practiq")
+    current = db.query(Plan).order_by(Plan.id).first()
+    try:
+        raised = False
+        try:
+            service.create_subscription(
+                SubscriptionCreate(
+                    plan_id=current.id, user_id="teacher-1", payer_email="t@example.com", card_token_id="tok"
+                )
+            )
+        except ValueError as exc:
+            raised = str(exc) == "already_subscribed_to_plan"
+        assert raised
+        assert mp.cancelled == [], "nothing may be cancelled"
+        assert mp.created == 0
     finally:
         db.close()

@@ -89,6 +89,23 @@ class SubscriptionService:
             .first()
         )
 
+    # Statuses that mean the gateway may still charge this subscription. A
+    # cancelled one never will, and a rejected one never did.
+    LIVE_STATUSES = ("pending", "authorized", "active", "paused")
+
+    def live_subscription(self, user_id: str) -> Subscription | None:
+        """The subscription a user is currently on the hook for, if any."""
+        return (
+            self.db.query(Subscription)
+            .filter(
+                Subscription.user_id == user_id,
+                Subscription.tenant == self.tenant,
+                Subscription.status.in_(self.LIVE_STATUSES),
+            )
+            .order_by(Subscription.created_at.desc())
+            .first()
+        )
+
     def create_subscription(self, data: SubscriptionCreate) -> Subscription:
         plan = self.get_plan(data.plan_id)
         if not plan:
@@ -97,6 +114,27 @@ class SubscriptionService:
             raise ValueError("plan_not_linked_to_gateway")
         if not self.webhook_url:
             raise ValueError("subscription_webhook_url_not_configured")
+
+        # Everything that can be checked is checked before anything is
+        # cancelled, so a request that was never going to work does not cost
+        # somebody the subscription they already had.
+        cancelled_at_gateway: str | None = None
+        existing = self.live_subscription(data.user_id)
+        if existing:
+            if existing.plan_id == plan.id:
+                raise ValueError("already_subscribed_to_plan")
+            # Cancelled first, deliberately. Creating first and cancelling
+            # after leaves two live agreements at the gateway if the second
+            # step fails, and the payer is charged twice; failing this way
+            # leaves them on the free plan, able to try again. Losing access
+            # is recoverable, a double charge is a refund and a lost customer.
+            cancelled_at_gateway = existing.gateway_subscription_id
+            if cancelled_at_gateway:
+                self.mp.cancel_subscription(cancelled_at_gateway)
+            existing.status = "cancelled"
+            existing.cancelled_at = datetime.utcnow()
+            self.db.flush()
+
         sub = Subscription(
             tenant=self.tenant,
             plan_id=plan.id,
@@ -120,10 +158,28 @@ class SubscriptionService:
             self._sync_subscription_dates(sub, result)
         except MercadopagoAPIException:
             self.db.rollback()
+            # A rollback undoes our rows, not the gateway's. The old agreement
+            # was already cancelled there and no rollback brings it back, so
+            # the record has to be corrected to say so — otherwise we would
+            # show a subscription as live that will never be charged again.
+            if cancelled_at_gateway:
+                self._record_cancellation(cancelled_at_gateway)
             raise
         self.db.commit()
         self.db.refresh(sub)
         return sub
+
+    def _record_cancellation(self, gateway_subscription_id: str) -> None:
+        stale = (
+            self.db.query(Subscription)
+            .filter(Subscription.gateway_subscription_id == gateway_subscription_id)
+            .first()
+        )
+        if not stale:
+            return
+        stale.status = "cancelled"
+        stale.cancelled_at = datetime.utcnow()
+        self.db.commit()
 
     def _sync_subscription_dates(self, sub: Subscription, provider_data: dict) -> None:
         """Provider dates are authoritative; do not invent 30-day months locally."""
