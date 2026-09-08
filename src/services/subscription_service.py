@@ -15,10 +15,15 @@ class SubscriptionService:
         db: Session,
         mp_subscription: MercadopagoSubscriptionService,
         webhook_url: str = "",
+        tenant: str = "default",
     ):
         self.db = db
         self.mp = mp_subscription
         self.webhook_url = webhook_url
+        # Every read a caller can reach goes through this. It comes from the
+        # API key, so a product can only ever see its own rows even when it
+        # asks for an id that belongs to another one.
+        self.tenant = tenant
 
     @staticmethod
     def _as_datetime(value: str | None) -> datetime | None:
@@ -37,6 +42,7 @@ class SubscriptionService:
 
     def create_plan(self, data: PlanCreate) -> Plan:
         plan = Plan(
+            tenant=self.tenant,
             name=data.name,
             description=data.description,
             amount=data.amount,
@@ -44,6 +50,7 @@ class SubscriptionService:
             interval=data.interval,
             interval_count=data.interval_count,
             gateway="mercadopago",
+            plan_metadata=data.metadata or {},
         )
         self.db.add(plan)
         self.db.flush()
@@ -65,13 +72,17 @@ class SubscriptionService:
         return plan
 
     def list_plans(self, active_only: bool = True) -> list[Plan]:
-        q = self.db.query(Plan)
+        q = self.db.query(Plan).filter(Plan.tenant == self.tenant)
         if active_only:
             q = q.filter(Plan.active == 1)
         return q.order_by(Plan.id).all()
 
     def get_plan(self, plan_id: int) -> Plan | None:
-        return self.db.query(Plan).filter(Plan.id == plan_id).first()
+        return (
+            self.db.query(Plan)
+            .filter(Plan.id == plan_id, Plan.tenant == self.tenant)
+            .first()
+        )
 
     def create_subscription(self, data: SubscriptionCreate) -> Subscription:
         plan = self.get_plan(data.plan_id)
@@ -82,6 +93,7 @@ class SubscriptionService:
         if not self.webhook_url:
             raise ValueError("subscription_webhook_url_not_configured")
         sub = Subscription(
+            tenant=self.tenant,
             plan_id=plan.id,
             user_id=data.user_id,
             gateway="mercadopago",
@@ -119,12 +131,16 @@ class SubscriptionService:
             sub.current_period_end = next_payment_at
 
     def get_subscription(self, subscription_id: int) -> Subscription | None:
-        return self.db.query(Subscription).filter(Subscription.id == subscription_id).first()
+        return (
+            self.db.query(Subscription)
+            .filter(Subscription.id == subscription_id, Subscription.tenant == self.tenant)
+            .first()
+        )
 
     def get_subscription_by_user(self, user_id: str) -> list[Subscription]:
         return (
             self.db.query(Subscription)
-            .filter(Subscription.user_id == user_id)
+            .filter(Subscription.user_id == user_id, Subscription.tenant == self.tenant)
             .order_by(Subscription.created_at.desc())
             .all()
         )
@@ -135,6 +151,7 @@ class SubscriptionService:
             self.db.query(Subscription)
             .filter(
                 Subscription.user_id == user_id,
+                Subscription.tenant == self.tenant,
                 Subscription.status.in_(["authorized", "active"]),
                 (Subscription.current_period_end.is_(None)) | (Subscription.current_period_end > now),
             )
@@ -188,6 +205,10 @@ class SubscriptionService:
         self.db.commit()
         return cancelled
 
+    # The methods below are reached from webhooks, which have no API key and so
+    # no tenant. They look rows up by gateway identifiers, which the gateway
+    # issues globally, so a lookup cannot land on another product's row and
+    # there is nothing for a tenant filter to narrow.
     def update_subscription_status(self, gateway_subscription_id: str, status: str) -> Subscription | None:
         sub = (
             self.db.query(Subscription)
@@ -219,7 +240,7 @@ class SubscriptionService:
         sub = self.get_subscription(subscription_id)
         if not sub:
             raise ValueError("subscription_not_found")
-        if data.active_seats < 0 or data.unit_amount < 0 or data.minimum_amount < 0:
+        if data.quantity < 0 or data.unit_amount < 0 or data.minimum_amount < 0:
             raise ValueError("invalid_billing_amount")
         if data.period_end <= data.period_start:
             raise ValueError("invalid_billing_period")
@@ -230,14 +251,14 @@ class SubscriptionService:
         )
         if existing:
             raise ValueError("billing_cycle_already_exists")
-        amount = max(data.unit_amount * data.active_seats, data.minimum_amount).quantize(
+        amount = max(data.unit_amount * data.quantity, data.minimum_amount).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
         cycle = BillingCycle(
             subscription_id=subscription_id,
             period_start=data.period_start,
             period_end=data.period_end,
-            active_seats=data.active_seats,
+            quantity=data.quantity,
             unit_amount=data.unit_amount,
             minimum_amount=data.minimum_amount,
             amount=amount,

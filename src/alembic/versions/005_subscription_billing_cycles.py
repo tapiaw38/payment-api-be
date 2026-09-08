@@ -23,7 +23,7 @@ def upgrade():
         sa.Column("subscription_id", sa.Integer(), sa.ForeignKey("subscriptions.id"), nullable=False),
         sa.Column("period_start", sa.DateTime(), nullable=False),
         sa.Column("period_end", sa.DateTime(), nullable=False),
-        sa.Column("active_seats", sa.Integer(), nullable=False),
+        sa.Column("quantity", sa.Integer(), nullable=False),
         sa.Column("unit_amount", sa.Numeric(14, 2), nullable=False),
         sa.Column("minimum_amount", sa.Numeric(14, 2), nullable=False),
         sa.Column("amount", sa.Numeric(14, 2), nullable=False),

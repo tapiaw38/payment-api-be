@@ -21,7 +21,29 @@ class Settings(BaseSettings):
     else:
         ROOT_PATH = ""
 
+    # One key per calling product: "practiq:key1,yego:key2". The key is what
+    # says who is asking, so it decides both whether a request is allowed and
+    # which tenant's rows it can see.
+    #
+    # PAYMENTS_API_KEY is still read for the single-product deployments that
+    # predate this, and maps to the "default" tenant.
+    api_keys_raw: str = os.environ.get("PAYMENTS_API_KEYS", "")
     api_key: str = os.environ.get("PAYMENTS_API_KEY", "")
+
+    @property
+    def tenant_by_api_key(self) -> dict[str, str]:
+        keys: dict[str, str] = {}
+        for entry in self.api_keys_raw.split(","):
+            entry = entry.strip()
+            if not entry or ":" not in entry:
+                continue
+            tenant, _, key = entry.partition(":")
+            tenant, key = tenant.strip(), key.strip()
+            if tenant and key:
+                keys[key] = tenant
+        if self.api_key:
+            keys.setdefault(self.api_key, "default")
+        return keys
 
     mercadopago_public_key: str = os.environ.get("MP_PUBLIC_KEY_AR", "")
     mercadopago_access_token: str = os.environ.get("MP_ACCESS_TOKEN", "")

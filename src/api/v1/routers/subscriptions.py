@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from api.v1.dependencies.subscriptions import get_db, get_mp_subscription_service
 from config.settings import settings
@@ -20,6 +20,7 @@ router = APIRouter()
 
 
 def _service(
+    request: Request,
     db: Session = Depends(get_db),
     mp: MercadopagoSubscriptionService = Depends(get_mp_subscription_service),
 ) -> SubscriptionService:
@@ -27,6 +28,9 @@ def _service(
         db=db,
         mp_subscription=mp,
         webhook_url=settings.mercadopago_subscription_webhook_url,
+        # Set by the API key middleware. Reading it from the request body
+        # instead would let a caller name a tenant it has no key for.
+        tenant=getattr(request.state, "tenant", "default"),
     )
 
 
@@ -105,6 +109,7 @@ def get_entitlement(user_id: str, service: SubscriptionService = Depends(_servic
         subscription_id=subscription.id,
         plan_id=subscription.plan_id,
         access_until=subscription.current_period_end,
+        metadata=(subscription.plan.plan_metadata if subscription.plan else None) or {},
     )
 
 

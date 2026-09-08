@@ -24,20 +24,35 @@ app.add_middleware(
 )
 
 
+# Paths that answer without a key. Webhooks are called by Mercado Pago, which
+# has no key to send; they authenticate by signature instead.
+UNAUTHENTICATED_PREFIXES = ("/api/v1/webhooks",)
+
+
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
-    # Webhooks are called by MercadoPago, skip API key check
-    if request.url.path.startswith("/api/v1/webhooks"):
+    if request.url.path.startswith(UNAUTHENTICATED_PREFIXES):
         return await call_next(request)
-    # Skip preflight requests
     if request.method == "OPTIONS":
         return await call_next(request)
-    # If no API key is configured, skip check (dev mode without key)
-    if not settings.api_key:
-        return await call_next(request)
-    api_key = request.headers.get("X-API-Key")
-    if api_key != settings.api_key:
+
+    keys = settings.tenant_by_api_key
+    if not keys:
+        # Fails closed. This used to serve every request when no key was
+        # configured, which meant one missing environment variable exposed
+        # plan creation and every subscription in the database.
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "payments api keys are not configured"},
+        )
+
+    tenant = keys.get(request.headers.get("X-API-Key") or "")
+    if not tenant:
         return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+
+    # Handlers read the tenant from here, never from the request: a caller must
+    # not be able to name a tenant it does not hold the key for.
+    request.state.tenant = tenant
     return await call_next(request)
 
 # routers
