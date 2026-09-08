@@ -29,6 +29,7 @@ def _service(
         db=db,
         mp_subscription=mp,
         webhook_url=settings.mercadopago_subscription_webhook_url,
+        back_url=settings.mercadopago_back_url,
         # Set by the API key middleware. Reading it from the request body
         # instead would let a caller name a tenant it has no key for.
         tenant=getattr(request.state, "tenant", "default"),
@@ -51,6 +52,8 @@ def create_plan(
     try:
         plan = service.create_plan(data)
         return plan
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except MercadopagoAPIException as e:
         raise HTTPException(status_code=e.status_code, detail={"code": e.error_code, "message": e.error_msg})
 

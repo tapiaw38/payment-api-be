@@ -40,10 +40,18 @@ class MercadopagoSubscriptionService:
         self,
         reason: str,
         amount: float,
+        back_url: str,
         currency: str = "ARS",
         frequency: int = 1,
         frequency_type: str = "months",
     ) -> dict[str, Any]:
+        """Publishes a plan.
+
+        back_url is required by the gateway and was missing, which is why every
+        creation came back as "Parameters passed are invalid" — a message that
+        names nothing. Sent on its own the request says "Back url is required",
+        which is how this was found.
+        """
         body = {
             "reason": reason,
             "auto_recurring": {
@@ -52,7 +60,13 @@ class MercadopagoSubscriptionService:
                 "transaction_amount": amount,
                 "currency_id": currency,
             },
-            "payment_methods_allowed": [{"payment_type_id": "credit_card"}, {"payment_type_id": "debit_card"}],
+            "back_url": back_url,
+            # An object with payment_types and payment_methods. The list form
+            # this used to send is rejected the same silent way.
+            "payment_methods_allowed": {
+                "payment_types": [{"id": "credit_card"}, {"id": "debit_card"}],
+                "payment_methods": [],
+            },
         }
         return self._send_request("POST", "/preapproval_plan", json_body=body)
 

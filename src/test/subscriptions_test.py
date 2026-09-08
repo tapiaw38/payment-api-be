@@ -9,7 +9,7 @@ from api.v1.routers.webhooks import _validate_signature
 from config.settings import settings
 from db.models import Plan, Subscription
 from db.session import Base
-from schemas.subscriptions import BillingCycleCreate, PlanResponse
+from schemas.subscriptions import BillingCycleCreate, PlanCreate, PlanResponse
 from services.subscription_service import SubscriptionService
 
 
@@ -216,5 +216,56 @@ def test_a_cancelled_subscription_cannot_be_resumed():
             raised = str(exc) == "subscription_not_paused"
         assert raised, "resuming a cancelled subscription must be refused"
         assert mp.calls == [], "the gateway must not be called at all"
+    finally:
+        db.close()
+
+
+class PlanRecordingMercadoPago:
+    def __init__(self):
+        self.body: dict = {}
+
+    def create_plan(self, **kwargs) -> dict:
+        self.body = kwargs
+        return {"id": "preapproval-plan-1"}
+
+
+def test_publishing_a_plan_sends_the_back_url_the_gateway_requires():
+    """The gateway rejects a plan with no back_url.
+
+    It answers "Parameters passed are invalid", which names nothing, so this
+    failed silently for every plan until the request was cut down until the
+    gateway said what it actually wanted.
+    """
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    mp = PlanRecordingMercadoPago()
+    service = SubscriptionService(
+        db, mp, back_url="https://practiq.example/teacher/subscription", tenant="practiq"
+    )
+    try:
+        service.create_plan(
+            PlanCreate(name="Equipo", amount=25000, interval="month", metadata={"max_students": 5})
+        )
+        assert mp.body["back_url"] == "https://practiq.example/teacher/subscription"
+    finally:
+        db.close()
+
+
+def test_a_plan_is_refused_when_no_back_url_is_configured():
+    """Better a loud failure than a plan row pointing at no gateway plan."""
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    mp = PlanRecordingMercadoPago()
+    service = SubscriptionService(db, mp, tenant="practiq")
+    try:
+        raised = False
+        try:
+            service.create_plan(PlanCreate(name="Equipo", amount=25000, interval="month"))
+        except ValueError as exc:
+            raised = str(exc) == "back_url_not_configured"
+        assert raised
+        assert mp.body == {}, "the gateway must not be called at all"
     finally:
         db.close()

@@ -15,11 +15,13 @@ class SubscriptionService:
         db: Session,
         mp_subscription: MercadopagoSubscriptionService,
         webhook_url: str = "",
+        back_url: str = "",
         tenant: str = "default",
     ):
         self.db = db
         self.mp = mp_subscription
         self.webhook_url = webhook_url
+        self.back_url = back_url
         # Every read a caller can reach goes through this. It comes from the
         # API key, so a product can only ever see its own rows even when it
         # asks for an id that belongs to another one.
@@ -41,6 +43,8 @@ class SubscriptionService:
         return 1, "months"
 
     def create_plan(self, data: PlanCreate) -> Plan:
+        if not self.back_url:
+            raise ValueError("back_url_not_configured")
         plan = Plan(
             tenant=self.tenant,
             name=data.name,
@@ -59,6 +63,7 @@ class SubscriptionService:
             result = self.mp.create_plan(
                 reason=data.name,
                 amount=data.amount,
+                back_url=self.back_url,
                 currency=data.currency,
                 frequency=freq,
                 frequency_type=freq_type,

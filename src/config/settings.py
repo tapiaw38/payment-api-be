@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     # Subscription notifications must target this service, never a URL supplied
     # by a browser/client request.
     mercadopago_subscription_webhook_url: str = os.environ.get("MP_SUBSCRIPTION_WEBHOOK_URL", "")
+    # Where the gateway sends the payer back after they authorise. Required by
+    # the gateway when publishing a plan, and per deployment because it points
+    # at the product's own screen.
+    mercadopago_back_url: str = os.environ.get("MP_BACK_URL", "")
 
     database_url: str = os.environ.get(
         "DATABASE_URL",
