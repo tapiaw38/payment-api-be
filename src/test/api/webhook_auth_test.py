@@ -10,7 +10,7 @@ import os
 
 from fastapi.testclient import TestClient
 
-os.environ.setdefault("PAYMENTS_API_KEYS", "test:test-key")
+os.environ["PAYMENTS_API_KEYS"] = "test:test-key"
 
 
 def _client(root_path: str) -> TestClient:

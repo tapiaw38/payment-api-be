@@ -12,6 +12,8 @@ from schemas.subscriptions import (
     EntitlementResponse,
     HostedSubscriptionCreate,
     HostedSubscriptionResponse,
+    PlanChangeCreate,
+    PlanChangeResponse,
     PlanCreate,
     PlanResponse,
     PlanUpdate,
@@ -117,6 +119,29 @@ def create_subscription(
         raise HTTPException(status_code=e.status_code, detail={"code": e.error_code, "message": e.error_msg})
 
 
+@router.post("/subscriptions/change-plan", response_model=PlanChangeResponse)
+def change_plan(
+    data: PlanChangeCreate,
+    service: SubscriptionService = Depends(_service),
+):
+    """Moves a live subscription to another plan, charging only the difference."""
+    try:
+        sub, charged = service.change_plan(data)
+        return PlanChangeResponse(
+            subscription_id=sub.id, plan_id=sub.plan_id, status=sub.status, charged=float(charged)
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e.args[0]))
+    except MercadopagoAPIException as e:
+        logger.warning(
+            "Mercado Pago plan change rejected status=%s code=%s message=%s",
+            e.status_code,
+            e.error_code or "unknown",
+            e.error_msg,
+        )
+        raise HTTPException(status_code=e.status_code, detail={"code": e.error_code, "message": e.error_msg})
+
+
 # Declared before /subscriptions/{subscription_id}: that one takes an int, so
 # a static sibling registered after it answers 422 instead of running.
 @router.post("/subscriptions/hosted", response_model=HostedSubscriptionResponse)
@@ -172,6 +197,7 @@ def get_entitlement(user_id: str, service: SubscriptionService = Depends(_servic
         subscription_id=subscription.id,
         plan_id=subscription.plan_id,
         access_until=subscription.current_period_end,
+        status=subscription.status,
         metadata=(subscription.plan.plan_metadata if subscription.plan else None) or {},
     )
 
@@ -203,11 +229,10 @@ def resume_subscription(subscription_id: int, service: SubscriptionService = Dep
 @router.post("/subscriptions/{subscription_id}/cancel")
 def cancel_subscription(
     subscription_id: int,
-    at_period_end: bool = False,
     service: SubscriptionService = Depends(_service),
 ):
     try:
-        sub = service.cancel_subscription(subscription_id, at_period_end=at_period_end)
+        sub = service.cancel_subscription(subscription_id)
         if not sub:
             raise HTTPException(status_code=404, detail="subscription_not_found")
         return {"status": sub.status}
@@ -239,9 +264,3 @@ def schedule_billing_cycle(
         return cycle
     except MercadopagoAPIException as e:
         raise HTTPException(status_code=e.status_code, detail={"code": e.error_code, "message": e.error_msg})
-
-
-@router.post("/subscriptions/reconcile-cancellations")
-def reconcile_cancellations(service: SubscriptionService = Depends(_service)):
-    """Internal scheduled-job endpoint; protected by the service API key."""
-    return {"cancelled": [sub.id for sub in service.cancel_due_subscriptions()]}

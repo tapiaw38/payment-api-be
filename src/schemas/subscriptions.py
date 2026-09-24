@@ -71,6 +71,31 @@ class SubscriptionCreate(BaseModel):
     notification_url: str | None = None
 
 
+class PlanChangeCreate(BaseModel):
+    """Moving an existing subscription to another plan.
+
+    The card is needed only for the prorated difference; the agreement itself
+    keeps charging whatever it already had on file.
+    """
+
+    plan_id: int
+    user_id: str
+    payer_email: str
+    card_token_id: str
+    # Mercado Pago will not take a one-off payment without it, and the token
+    # does not carry it — the browser resolves it from the card's first digits.
+    payment_method_id: str
+
+
+class PlanChangeResponse(BaseModel):
+    subscription_id: int
+    plan_id: int
+    status: str
+    # What was taken now for the rest of the current period. Zero when moving
+    # down: the cheaper price simply starts at renewal.
+    charged: float
+
+
 class HostedSubscriptionCreate(BaseModel):
     """Subscribing without handing us a card.
 
@@ -139,6 +164,11 @@ class EntitlementResponse(BaseModel):
     subscription_id: int | None = None
     plan_id: int | None = None
     access_until: datetime | None = None
+    # The agreement's own status, which `active` no longer implies. Somebody
+    # paused or cancelled keeps the access they paid for until access_until, so
+    # a product has to be able to tell that apart from a running subscription —
+    # otherwise it would show them nothing to resume.
+    status: str | None = None
     # The plan's metadata, so one call answers both questions a product has:
     # is this user paid up, and what does their plan allow. Empty when there
     # is no active subscription.

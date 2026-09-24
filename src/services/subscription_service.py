@@ -9,6 +9,7 @@ from gateways.mercadopago.subscriptions_service import MercadopagoSubscriptionSe
 from schemas.subscriptions import (
     BillingCycleCreate,
     HostedSubscriptionCreate,
+    PlanChangeCreate,
     PlanCreate,
     PlanUpdate,
     SubscriptionCreate,
@@ -182,6 +183,110 @@ class SubscriptionService:
         self.db.refresh(sub)
         return sub
 
+    @staticmethod
+    def proration(
+        old_amount: Decimal,
+        new_amount: Decimal,
+        period_start: datetime | None,
+        period_end: datetime | None,
+        now: datetime,
+    ) -> Decimal:
+        """What the rest of this period costs at the difference in price.
+
+        Moving up mid-cycle used to mean paying the new plan in full on top of
+        the month already bought, and forfeiting what was left of it. Only the
+        unused part of the gap is owed. Moving down owes nothing: the cheaper
+        price starts at renewal and nothing is refunded.
+        """
+        gap = Decimal(new_amount) - Decimal(old_amount)
+        if gap <= 0 or not period_end or period_end <= now:
+            return Decimal("0.00")
+        # A period with no recorded start is a month, which is what every plan
+        # here bills. Guessing longer would undercharge.
+        start = period_start or (period_end - timedelta(days=30))
+        total = (period_end - start).total_seconds()
+        if total <= 0:
+            return Decimal("0.00")
+        remaining = (period_end - now).total_seconds()
+        ratio = Decimal(str(min(remaining / total, 1.0)))
+        return (gap * ratio).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def change_plan(self, data: PlanChangeCreate) -> tuple[Subscription, Decimal]:
+        """Moves a live subscription to another plan, keeping the agreement.
+
+        Cancelling and recreating charged the new plan in full immediately and
+        threw away the rest of the month already paid for — 300 for one month
+        on a 100 plan moving to 200 halfway. The gateway can restate the amount
+        on the agreement instead, which leaves the billing date alone, so the
+        only thing owed now is the difference for the days remaining.
+        """
+        plan = self.get_plan(data.plan_id)
+        if not plan:
+            raise ValueError("plan_not_found")
+        sub = self.live_subscription(data.user_id)
+        if not sub or not sub.gateway_subscription_id:
+            raise ValueError("no_live_subscription")
+        if sub.status not in ("authorized", "active"):
+            # A paused agreement is not being charged; resuming it first is
+            # what the teacher means, and it keeps the billing date honest.
+            raise ValueError("subscription_not_active")
+        if sub.plan_id == plan.id:
+            raise ValueError("already_subscribed_to_plan")
+
+        old_amount = Decimal(sub.plan.amount) if sub.plan else Decimal("0")
+        new_amount = Decimal(plan.amount)
+        currency = plan.currency or "ARS"
+        owed = self.proration(
+            old_amount, new_amount, sub.current_period_start, sub.current_period_end, datetime.utcnow()
+        )
+
+        # The agreement moves first because it can be moved back. A charge
+        # cannot: taking the difference and then failing to grant the plan
+        # would need a refund, and refunds are somebody's afternoon.
+        self.mp.update_subscription_amount(sub.gateway_subscription_id, float(new_amount), currency)
+        if owed > 0:
+            try:
+                self._charge_difference(sub, data, owed, currency, plan.name)
+            except MercadopagoAPIException:
+                self.mp.update_subscription_amount(
+                    sub.gateway_subscription_id, float(old_amount), currency
+                )
+                self.db.rollback()
+                raise
+
+        sub.plan_id = plan.id
+        self.db.commit()
+        self.db.refresh(sub)
+        return sub, owed
+
+    def _charge_difference(
+        self,
+        sub: Subscription,
+        data: PlanChangeCreate,
+        amount: Decimal,
+        currency: str,
+        plan_name: str,
+    ) -> None:
+        from services.payment_service import PaymentService
+        from gateways.mercadopago.payments_service import MercadopagoPaymentService
+        from schemas.payments import PaymentCreate, PaymentPayer
+
+        payments = PaymentService(
+            db=self.db,
+            mp_payment=MercadopagoPaymentService(access_token=self.mp.access_token),
+        )
+        payments.create_payment(
+            PaymentCreate(
+                transaction_amount=float(amount),
+                token=data.card_token_id,
+                payment_method_id=data.payment_method_id,
+                payer=PaymentPayer(email=data.payer_email),
+                description=f"Diferencia por pasar a {plan_name}",
+                external_reference=f"plan-change-{sub.id}",
+                user_id=sub.user_id,
+            )
+        )
+
     def start_hosted_subscription(self, data: HostedSubscriptionCreate) -> tuple[Subscription, str]:
         """Opens an agreement for the payer to authorise at Mercado Pago.
 
@@ -346,6 +451,13 @@ class SubscriptionService:
             .all()
         )
 
+    # Statuses that mean somebody is entitled right now. Paused and cancelled
+    # are in because the period they already paid for does not stop being paid
+    # for: pausing on the 9th, covered to the 24th, used to cost two weeks of
+    # access that had been bought. What they stop is the next charge, not this
+    # one. Pending is not in — nothing has been paid yet.
+    ENTITLED_STATUSES = ("authorized", "active", "paused", "cancelled")
+
     def get_entitlement(self, user_id: str) -> Subscription | None:
         now = datetime.utcnow()
         return (
@@ -353,10 +465,23 @@ class SubscriptionService:
             .filter(
                 Subscription.user_id == user_id,
                 Subscription.tenant == self.tenant,
-                Subscription.status.in_(["authorized", "active"]),
-                (Subscription.current_period_end.is_(None)) | (Subscription.current_period_end > now),
+                Subscription.status.in_(self.ENTITLED_STATUSES),
+                # A live subscription with no end date is entitled; a paused or
+                # cancelled one has to name the day it was paid up to.
+                (
+                    Subscription.current_period_end.is_(None)
+                    & Subscription.status.in_(["authorized", "active"])
+                )
+                | (Subscription.current_period_end > now),
             )
-            .order_by(Subscription.current_period_end.desc().nullslast(), Subscription.created_at.desc())
+            # NULLS LAST spelled portably: SQLite has no such clause, and the
+            # tests run on it — so the untestable version was the one shipped
+            # to a money path.
+            .order_by(
+                Subscription.current_period_end.is_(None).asc(),
+                Subscription.current_period_end.desc(),
+                Subscription.created_at.desc(),
+            )
             .first()
         )
 
@@ -448,15 +573,19 @@ class SubscriptionService:
         self.db.refresh(sub)
         return sub
 
-    def cancel_subscription(self, subscription_id: int, at_period_end: bool = False) -> Subscription | None:
+    def cancel_subscription(self, subscription_id: int) -> Subscription | None:
+        """Ends the agreement now; the period already paid for is kept.
+
+        There used to be an at_period_end mode that deferred the cancellation
+        itself and left a scheduled job to carry it out. Nothing ran that job,
+        and a late run would have charged somebody who had cancelled. Since the
+        entitlement now honours a cancelled subscription until its period ends,
+        cancelling at the gateway straight away gives the same access with
+        nothing left to go wrong.
+        """
         sub = self.get_subscription(subscription_id)
         if not sub or not sub.gateway_subscription_id:
             return None
-        if at_period_end:
-            sub.cancel_at_period_end = 1
-            self.db.commit()
-            self.db.refresh(sub)
-            return sub
         try:
             self.mp.cancel_subscription(sub.gateway_subscription_id)
         except MercadopagoAPIException:
@@ -468,36 +597,6 @@ class SubscriptionService:
         self.db.refresh(sub)
         return sub
 
-    def cancel_due_subscriptions(self, now: datetime | None = None) -> list[Subscription]:
-        """Called by a trusted scheduled worker after paid access expires."""
-        now = now or datetime.utcnow()
-        due = (
-            self.db.query(Subscription)
-            .filter(
-                Subscription.cancel_at_period_end == 1,
-                Subscription.current_period_end.isnot(None),
-                Subscription.current_period_end <= now,
-                Subscription.status.in_(["authorized", "active"]),
-            )
-            .all()
-        )
-        cancelled = []
-        for sub in due:
-            try:
-                self.mp.cancel_subscription(sub.gateway_subscription_id)
-            except MercadopagoAPIException:
-                self.db.rollback()
-                continue
-            sub.status = "cancelled"
-            sub.cancelled_at = now
-            cancelled.append(sub)
-        self.db.commit()
-        return cancelled
-
-    # The methods below are reached from webhooks, which have no API key and so
-    # no tenant. They look rows up by gateway identifiers, which the gateway
-    # issues globally, so a lookup cannot land on another product's row and
-    # there is nothing for a tenant filter to narrow.
     def update_subscription_status(self, gateway_subscription_id: str, status: str) -> Subscription | None:
         sub = (
             self.db.query(Subscription)

@@ -147,7 +147,10 @@ class TestMercadopagoApi:
         )
 
         # call the endpoint that triggers the mercadopagoservice methods
-        endpoint_url = f"{self.base_url_mercadopago}/payment_method/"
+        # No trailing slash: the route is registered without one, so this asked
+        # for a path that does not exist and got a 404 — the 400 it claims to
+        # check was never reached.
+        endpoint_url = f"{self.base_url_mercadopago}/payment_method"
         response = client.get(
             url=endpoint_url,
             params={"bin": "123456789"},

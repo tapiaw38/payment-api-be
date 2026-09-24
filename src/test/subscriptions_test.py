@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -587,5 +587,98 @@ def test_correcting_the_email_opens_a_new_agreement():
         assert second.id != first.id, "a different address needs its own agreement"
         assert mp.cancelled == ["preapproval-hosted"], "the rejected one must be cancelled"
         assert second.payer_email == "mercadopago@example.com"
+    finally:
+        db.close()
+
+
+def test_paid_time_survives_a_pause():
+    """Pausing stops the next charge, not the month already bought.
+
+    Pausing on the 9th with access paid to the 24th used to drop the teacher
+    to the free plan that instant, costing two weeks they had already paid
+    for and deactivating students over the free limit.
+    """
+    db = _subscription_db("paused")
+    sub = db.query(Subscription).first()
+    sub.current_period_end = datetime.utcnow() + timedelta(days=15)
+    db.commit()
+    service = SubscriptionService(db, NoopMercadoPago(), tenant="practiq")
+    try:
+        entitlement = service.get_entitlement("teacher-1")
+        assert entitlement is not None, "a paused subscription keeps what it paid for"
+        assert entitlement.status == "paused", "and must still read as paused"
+    finally:
+        db.close()
+
+
+def test_paid_time_survives_a_cancellation_and_then_runs_out():
+    db = _subscription_db("cancelled")
+    sub = db.query(Subscription).first()
+    sub.current_period_end = datetime.utcnow() + timedelta(days=3)
+    db.commit()
+    service = SubscriptionService(db, NoopMercadoPago(), tenant="practiq")
+    try:
+        assert service.get_entitlement("teacher-1") is not None
+
+        sub.current_period_end = datetime.utcnow() - timedelta(seconds=1)
+        db.commit()
+        assert service.get_entitlement("teacher-1") is None, "and stops the moment it expires"
+    finally:
+        db.close()
+
+
+def test_a_cancelled_subscription_without_a_paid_period_grants_nothing():
+    """No end date on a cancelled row means nothing is known to be paid for."""
+    db = _subscription_db("cancelled")
+    service = SubscriptionService(db, NoopMercadoPago(), tenant="practiq")
+    try:
+        assert service.get_entitlement("teacher-1") is None
+    finally:
+        db.close()
+
+
+def test_proration_charges_only_the_unused_difference():
+    start = datetime(2026, 9, 24)
+    end = datetime(2026, 10, 24)
+    # Halfway through: 15 of 30 days left on a 100 to 200 move.
+    halfway = datetime(2026, 10, 9)
+    owed = SubscriptionService.proration(Decimal("100"), Decimal("200"), start, end, halfway)
+    assert owed == Decimal("50.00"), owed
+
+
+def test_moving_down_owes_nothing():
+    start, end = datetime(2026, 9, 24), datetime(2026, 10, 24)
+    owed = SubscriptionService.proration(
+        Decimal("200"), Decimal("100"), start, end, datetime(2026, 10, 9)
+    )
+    assert owed == Decimal("0.00"), owed
+
+
+def test_proration_of_an_expired_period_owes_nothing():
+    start, end = datetime(2026, 9, 24), datetime(2026, 10, 24)
+    owed = SubscriptionService.proration(
+        Decimal("100"), Decimal("200"), start, end, datetime(2026, 10, 25)
+    )
+    assert owed == Decimal("0.00"), owed
+
+
+def test_cancelling_ends_the_agreement_now_and_keeps_the_paid_month():
+    """No deferred cancellation to go wrong: the entitlement carries the month.
+
+    The old at_period_end mode left the agreement running and a scheduled job
+    to end it. Nothing ran that job, and a late run would have charged someone
+    who had already cancelled.
+    """
+    db = _subscription_db("authorized")
+    sub = db.query(Subscription).first()
+    sub.current_period_end = datetime.utcnow() + timedelta(days=12)
+    db.commit()
+    mp = ResumableMercadoPago()
+    service = SubscriptionService(db, mp, tenant="practiq")
+    try:
+        cancelled = service.cancel_subscription(sub.id)
+        assert cancelled.status == "cancelled"
+        assert mp.cancelled == ["preapproval-1"], "the gateway stops charging immediately"
+        assert service.get_entitlement("teacher-1") is not None, "the paid month is kept"
     finally:
         db.close()
