@@ -31,7 +31,11 @@ UNAUTHENTICATED_PREFIXES = ("/api/v1/webhooks",)
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
-    if request.url.path.startswith(UNAUTHENTICATED_PREFIXES):
+    # The routed path, not request.url.path: Starlette builds that one as
+    # root_path + path, so with ROOT_PATH set every prefix here stopped
+    # matching and Mercado Pago's webhooks were answered 401 before their
+    # signature was ever checked.
+    if request.scope.get("path", "").startswith(UNAUTHENTICATED_PREFIXES):
         return await call_next(request)
     if request.method == "OPTIONS":
         return await call_next(request)
