@@ -36,6 +36,16 @@ class MercadopagoSubscriptionService:
             return {}
         return response.json()
 
+    # The only three a preapproval plan accepts: the gateway answers
+    # "Invalid value for payment_types" to anything else, prepaid_card
+    # included, which is why a prepaid card fails as a rejected first charge
+    # rather than at the form.
+    ALLOWED_PAYMENT_TYPES = [
+        {"id": "credit_card"},
+        {"id": "debit_card"},
+        {"id": "account_money"},
+    ]
+
     def create_plan(
         self,
         reason: str,
@@ -64,7 +74,7 @@ class MercadopagoSubscriptionService:
             # An object with payment_types and payment_methods. The list form
             # this used to send is rejected the same silent way.
             "payment_methods_allowed": {
-                "payment_types": [{"id": "credit_card"}, {"id": "debit_card"}],
+                "payment_types": self.ALLOWED_PAYMENT_TYPES,
                 "payment_methods": [],
             },
         }
@@ -83,7 +93,15 @@ class MercadopagoSubscriptionService:
         subscribed hold their own preapproval with its own amount and keep
         paying it until that subscription is updated too.
         """
-        body: dict[str, Any] = {}
+        # Restated on every edit: a plan published before a payment type was
+        # allowed keeps refusing it forever otherwise, and the refusal only
+        # ever surfaces as somebody's rejected first charge.
+        body: dict[str, Any] = {
+            "payment_methods_allowed": {
+                "payment_types": self.ALLOWED_PAYMENT_TYPES,
+                "payment_methods": [],
+            }
+        }
         if reason is not None:
             body["reason"] = reason
         if amount is not None:
