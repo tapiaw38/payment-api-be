@@ -18,7 +18,9 @@ from services.payment_service import PaymentService
 from services.subscription_service import SubscriptionService
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
+# Uvicorn configures this logger in production; using it makes rejected
+# webhook reasons visible in container logs without exposing signatures.
+logger = logging.getLogger("uvicorn.error")
 
 
 def _signature_parts(value: str) -> dict[str, str]:
