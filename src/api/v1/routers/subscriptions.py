@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from api.v1.dependencies.subscriptions import get_db, get_mp_subscription_service
@@ -18,6 +20,7 @@ from services.subscription_service import SubscriptionService
 from sqlalchemy.orm import Session
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _service(
@@ -101,6 +104,14 @@ def create_subscription(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e.args[0]))
     except MercadopagoAPIException as e:
+        # Provider answer, never card data: capture it server-side so a 400
+        # can be diagnosed without exposing payment internals to the browser.
+        logger.warning(
+            "Mercado Pago subscription rejected status=%s code=%s message=%s",
+            e.status_code,
+            e.error_code or "unknown",
+            e.error_msg,
+        )
         raise HTTPException(status_code=e.status_code, detail={"code": e.error_code, "message": e.error_msg})
 
 

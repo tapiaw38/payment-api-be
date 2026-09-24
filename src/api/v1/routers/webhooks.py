@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import json
+import logging
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Request
@@ -17,25 +18,43 @@ from services.payment_service import PaymentService
 from services.subscription_service import SubscriptionService
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _signature_parts(value: str) -> dict[str, str]:
-    return dict(part.split("=", 1) for part in value.split(",") if "=" in part)
+    # Mercado Pago sends a comma-separated header. Some proxies preserve the
+    # optional space after the comma ("ts=..., v1=..."); stripping both sides
+    # prevents a valid signature from being read as a missing `v1` field.
+    parts: dict[str, str] = {}
+    for part in value.split(","):
+        if "=" not in part:
+            continue
+        key, item = part.split("=", 1)
+        key, item = key.strip(), item.strip()
+        if key and item:
+            parts[key] = item
+    return parts
 
 
-def _validate_signature(request: Request, data_id: str) -> bool:
+def _validate_signature(request: Request, data_id: str) -> tuple[bool, str]:
     secret = settings.mercadopago_webhook_secret
     signature = request.headers.get("x-signature", "")
     request_id = request.headers.get("x-request-id", "")
-    if not secret or not signature or not request_id or not data_id:
-        return False
+    if not secret:
+        return False, "webhook_secret_missing"
+    if not signature:
+        return False, "signature_missing"
+    if not request_id:
+        return False, "request_id_missing"
+    if not data_id:
+        return False, "resource_id_missing"
     parts = _signature_parts(signature)
     timestamp, received_hash = parts.get("ts"), parts.get("v1")
     if not timestamp or not received_hash:
-        return False
+        return False, "signature_parts_missing"
     manifest = f"id:{data_id.lower()};request-id:{request_id};ts:{timestamp};"
     expected = hmac.new(secret.encode(), manifest.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, received_hash)
+    return hmac.compare_digest(expected, received_hash), "signature_mismatch"
 
 
 def _record_event(db, body: dict, topic: str, resource_id: str) -> WebhookEvent | None:
@@ -83,7 +102,16 @@ async def mercadopago_webhook(request: Request):
     resource_id = str(request.query_params.get("data.id") or (data.get("id") if isinstance(data, dict) else "") or "")
     if not topic or not resource_id:
         raise HTTPException(status_code=400, detail="missing_webhook_resource")
-    if not _validate_signature(request, resource_id):
+    valid_signature, rejection_reason = _validate_signature(request, resource_id)
+    if not valid_signature:
+        # Keep enough context to diagnose configuration/header formatting
+        # without logging signature material, tokens or the full payload.
+        logger.warning(
+            "Mercado Pago webhook signature rejected topic=%s resource=%s reason=%s",
+            topic,
+            resource_id,
+            rejection_reason,
+        )
         raise HTTPException(status_code=401, detail="invalid_webhook_signature")
 
     db = SessionLocal()
