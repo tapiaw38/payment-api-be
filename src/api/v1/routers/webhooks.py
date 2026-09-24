@@ -124,6 +124,14 @@ async def mercadopago_webhook(request: Request):
         try:
             _process_event(db, topic, resource_id)
         except Exception:
+            # Mercado Pago retries a 503 for days, so a failure that leaves no
+            # trace is a loop nobody can diagnose. The traceback carries no
+            # signature material, tokens or card data.
+            logger.exception(
+                "Mercado Pago webhook processing failed topic=%s resource=%s",
+                topic,
+                resource_id,
+            )
             event.status = "failed"
             db.commit()
             raise HTTPException(status_code=503, detail="webhook_processing_failed")
