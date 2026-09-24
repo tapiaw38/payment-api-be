@@ -10,7 +10,13 @@ from config.settings import settings
 from db.models import Plan, Subscription
 from db.session import Base
 from gateways.mercadopago.exceptions import MercadopagoAPIException
-from schemas.subscriptions import BillingCycleCreate, PlanCreate, PlanResponse, SubscriptionCreate
+from schemas.subscriptions import (
+    BillingCycleCreate,
+    HostedSubscriptionCreate,
+    PlanCreate,
+    PlanResponse,
+    SubscriptionCreate,
+)
 from services.subscription_service import SubscriptionService
 
 
@@ -390,5 +396,168 @@ def test_subscribing_again_to_the_same_plan_is_refused():
         assert raised
         assert mp.cancelled == [], "nothing may be cancelled"
         assert mp.created == 0
+    finally:
+        db.close()
+
+
+class HostedMercadoPago:
+    """Answers the planless preapproval call the hosted flow makes."""
+
+    def __init__(self, init_point: str = "https://mp.test/checkout?preapproval_id=abc"):
+        self.init_point = init_point
+        self.calls: list[dict] = []
+
+    def create_pending_subscription(self, **kwargs) -> dict:
+        self.calls.append(kwargs)
+        return {"id": "preapproval-hosted", "status": "pending", "init_point": self.init_point}
+
+
+def test_hosted_checkout_returns_somewhere_to_send_the_payer():
+    """No card token is involved: the payer authorises at the gateway."""
+    db = _two_plan_db()
+    # _two_plan_db leaves teacher-1 subscribed; this teacher is not.
+    mp = HostedMercadoPago()
+    service = SubscriptionService(
+        db, mp, webhook_url="https://hook", back_url="https://app.test/back", tenant="practiq"
+    )
+    plan = db.query(Plan).order_by(Plan.id).first()
+    try:
+        sub, init_point = service.start_hosted_subscription(
+            HostedSubscriptionCreate(plan_id=plan.id, user_id="teacher-2", payer_email="t2@example.com")
+        )
+        assert init_point == mp.init_point
+        assert sub.status == "pending"
+        assert sub.gateway_subscription_id == "preapproval-hosted"
+        # The webhook finds our row by external_reference, so it has to be sent.
+        assert mp.calls[0]["external_reference"] == str(sub.id)
+        assert mp.calls[0]["notification_url"] == "https://hook"
+    finally:
+        db.close()
+
+
+def test_hosted_checkout_refuses_somebody_already_subscribed():
+    """Cancelling up front would leave a payer with nothing if they close the tab."""
+    db = _two_plan_db()
+    mp = HostedMercadoPago()
+    service = SubscriptionService(
+        db, mp, webhook_url="https://hook", back_url="https://app.test/back", tenant="practiq"
+    )
+    plan = db.query(Plan).order_by(Plan.id.desc()).first()
+    try:
+        raised = ""
+        try:
+            service.start_hosted_subscription(
+                HostedSubscriptionCreate(plan_id=plan.id, user_id="teacher-1", payer_email="t@example.com")
+            )
+        except ValueError as e:
+            raised = str(e.args[0])
+        assert raised == "already_subscribed", raised
+        assert mp.calls == [], "the gateway must not be called at all"
+    finally:
+        db.close()
+
+
+class ResumableMercadoPago(HostedMercadoPago):
+    """A gateway that remembers the agreement it opened."""
+
+    def __init__(self, gateway_status: str = "pending"):
+        super().__init__()
+        self.gateway_status = gateway_status
+        self.cancelled: list[str] = []
+
+    def get_subscription(self, preapproval_id: str) -> dict:
+        return {
+            "id": preapproval_id,
+            "status": self.gateway_status,
+            "init_point": self.init_point,
+        }
+
+    def cancel_subscription(self, preapproval_id: str) -> dict:
+        self.cancelled.append(preapproval_id)
+        return {"status": "cancelled"}
+
+    def create_subscription(self, **kwargs) -> dict:
+        self.calls.append(kwargs)
+        return {"id": "preapproval-card", "status": "authorized"}
+
+
+def _hosted_service(db, mp):
+    return SubscriptionService(
+        db, mp, webhook_url="https://hook", back_url="https://app.test/back", tenant="practiq"
+    )
+
+
+def test_abandoning_the_gateway_does_not_lock_the_payer_out():
+    """A pending agreement grants nothing, so it must not block paying by card.
+
+    Hosted checkout leaves one behind every time somebody closes the tab at
+    Mercado Pago. Counting it as a live subscription shut the teacher out of
+    both doors: the hosted one said already_subscribed and the card one said
+    already_subscribed_to_plan.
+    """
+    db = _two_plan_db()
+    mp = ResumableMercadoPago()
+    plan = db.query(Plan).order_by(Plan.id).first()
+    try:
+        _hosted_service(db, mp).start_hosted_subscription(
+            HostedSubscriptionCreate(plan_id=plan.id, user_id="teacher-2", payer_email="t2@example.com")
+        )
+        # They give up on the gateway and reach for a card instead.
+        sub = _hosted_service(db, mp).create_subscription(
+            SubscriptionCreate(
+                plan_id=plan.id, user_id="teacher-2", payer_email="t2@example.com", card_token_id="tok"
+            )
+        )
+        assert sub.status == "authorized"
+        assert mp.cancelled == ["preapproval-hosted"], "the abandoned agreement must be cancelled"
+        live = [
+            s
+            for s in db.query(Subscription).filter(Subscription.user_id == "teacher-2").all()
+            if s.status in SubscriptionService.LIVE_STATUSES
+        ]
+        assert len(live) == 1, f"exactly one live subscription, got {len(live)}"
+    finally:
+        db.close()
+
+
+def test_clicking_again_returns_to_the_same_agreement():
+    """Opening a second agreement for the same plan would be a second charge."""
+    db = _two_plan_db()
+    mp = ResumableMercadoPago()
+    plan = db.query(Plan).order_by(Plan.id).first()
+    try:
+        service = _hosted_service(db, mp)
+        first, first_point = service.start_hosted_subscription(
+            HostedSubscriptionCreate(plan_id=plan.id, user_id="teacher-2", payer_email="t2@example.com")
+        )
+        again, again_point = _hosted_service(db, mp).start_hosted_subscription(
+            HostedSubscriptionCreate(plan_id=plan.id, user_id="teacher-2", payer_email="t2@example.com")
+        )
+        assert again.id == first.id
+        assert again_point == first_point
+        assert len(mp.calls) == 1, "the gateway must not be asked for a second agreement"
+    finally:
+        db.close()
+
+
+def test_a_pending_row_catches_up_when_the_payer_did_authorise():
+    """The webhook may not have landed yet; the screen must not offer to pay twice."""
+    db = _two_plan_db()
+    mp = ResumableMercadoPago(gateway_status="authorized")
+    plan = db.query(Plan).order_by(Plan.id).first()
+    try:
+        _hosted_service(db, mp).start_hosted_subscription(
+            HostedSubscriptionCreate(plan_id=plan.id, user_id="teacher-2", payer_email="t2@example.com")
+        )
+        mp.gateway_status = "authorized"
+        raised = ""
+        try:
+            _hosted_service(db, mp).start_hosted_subscription(
+                HostedSubscriptionCreate(plan_id=plan.id, user_id="teacher-2", payer_email="t2@example.com")
+            )
+        except ValueError as e:
+            raised = str(e.args[0])
+        assert raised == "already_subscribed", raised
+        assert mp.cancelled == [], "an authorised agreement must never be cancelled"
     finally:
         db.close()

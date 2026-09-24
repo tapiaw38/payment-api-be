@@ -71,6 +71,25 @@ class SubscriptionCreate(BaseModel):
     notification_url: str | None = None
 
 
+class HostedSubscriptionCreate(BaseModel):
+    """Subscribing without handing us a card.
+
+    The payer authorises at Mercado Pago, where they can choose their account
+    balance, so there is no card token to send.
+    """
+
+    plan_id: int
+    user_id: str
+    payer_email: str
+
+
+class HostedSubscriptionResponse(BaseModel):
+    subscription_id: int
+    status: str
+    # Where the payer has to be sent. Nothing is charged before they get there.
+    init_point: str
+
+
 class SubscriptionResponse(BaseModel):
     id: int
     plan_id: int

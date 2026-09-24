@@ -130,6 +130,46 @@ class MercadopagoSubscriptionService:
             body["notification_url"] = notification_url
         return self._send_request("POST", "/preapproval", json_body=body)
 
+    def create_pending_subscription(
+        self,
+        reason: str,
+        payer_email: str,
+        amount: float,
+        back_url: str,
+        external_reference: str | None = None,
+        notification_url: str | None = None,
+        currency: str = "ARS",
+        frequency: int = 1,
+        frequency_type: str = "months",
+    ) -> dict[str, Any]:
+        """Opens an agreement the payer authorises at Mercado Pago.
+
+        Returns an init_point to send them to, where they pick a card or their
+        account balance. The amount is restated here instead of naming the
+        plan: a preapproval that points at a preapproval_plan_id is refused
+        without a card_token_id, which is the whole thing we are avoiding.
+
+        Nothing is charged until the payer authorises, and external_reference
+        survives the round trip, so the webhook can find our row again.
+        """
+        body: dict[str, Any] = {
+            "reason": reason,
+            "payer_email": payer_email,
+            "status": "pending",
+            "back_url": back_url,
+            "auto_recurring": {
+                "frequency": frequency,
+                "frequency_type": frequency_type,
+                "transaction_amount": amount,
+                "currency_id": currency,
+            },
+        }
+        if external_reference:
+            body["external_reference"] = external_reference
+        if notification_url:
+            body["notification_url"] = notification_url
+        return self._send_request("POST", "/preapproval", json_body=body)
+
     def get_subscription(self, preapproval_id: str) -> dict[str, Any]:
         return self._send_request("GET", f"/preapproval/{preapproval_id}")
 

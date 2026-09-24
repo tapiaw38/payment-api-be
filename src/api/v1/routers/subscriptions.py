@@ -10,6 +10,8 @@ from schemas.subscriptions import (
     BillingCycleCreate,
     BillingCycleResponse,
     EntitlementResponse,
+    HostedSubscriptionCreate,
+    HostedSubscriptionResponse,
     PlanCreate,
     PlanResponse,
     PlanUpdate,
@@ -108,6 +110,31 @@ def create_subscription(
         # can be diagnosed without exposing payment internals to the browser.
         logger.warning(
             "Mercado Pago subscription rejected status=%s code=%s message=%s",
+            e.status_code,
+            e.error_code or "unknown",
+            e.error_msg,
+        )
+        raise HTTPException(status_code=e.status_code, detail={"code": e.error_code, "message": e.error_msg})
+
+
+# Declared before /subscriptions/{subscription_id}: that one takes an int, so
+# a static sibling registered after it answers 422 instead of running.
+@router.post("/subscriptions/hosted", response_model=HostedSubscriptionResponse)
+def start_hosted_subscription(
+    data: HostedSubscriptionCreate,
+    service: SubscriptionService = Depends(_service),
+):
+    """Subscribes without a card, by sending the payer to Mercado Pago."""
+    try:
+        sub, init_point = service.start_hosted_subscription(data)
+        return HostedSubscriptionResponse(
+            subscription_id=sub.id, status=sub.status, init_point=init_point
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e.args[0]))
+    except MercadopagoAPIException as e:
+        logger.warning(
+            "Mercado Pago hosted subscription rejected status=%s code=%s message=%s",
             e.status_code,
             e.error_code or "unknown",
             e.error_msg,

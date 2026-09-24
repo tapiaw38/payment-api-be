@@ -6,7 +6,13 @@ from sqlalchemy.orm import Session
 from db.models import BillingCycle, Plan, Subscription
 from gateways.mercadopago.exceptions import MercadopagoAPIException
 from gateways.mercadopago.subscriptions_service import MercadopagoSubscriptionService
-from schemas.subscriptions import BillingCycleCreate, PlanCreate, PlanUpdate, SubscriptionCreate
+from schemas.subscriptions import (
+    BillingCycleCreate,
+    HostedSubscriptionCreate,
+    PlanCreate,
+    PlanUpdate,
+    SubscriptionCreate,
+)
 
 
 class SubscriptionService:
@@ -118,6 +124,12 @@ class SubscriptionService:
         # Everything that can be checked is checked before anything is
         # cancelled, so a request that was never going to work does not cost
         # somebody the subscription they already had.
+        # An agreement opened by hosted checkout and never authorised counts as
+        # live, so without this a teacher who bounced off the gateway could not
+        # pay by card either — locked out of both doors by a row that grants
+        # nothing.
+        self._discard_pending(data.user_id)
+
         cancelled_at_gateway: str | None = None
         existing = self.live_subscription(data.user_id)
         if existing:
@@ -168,6 +180,126 @@ class SubscriptionService:
         self.db.commit()
         self.db.refresh(sub)
         return sub
+
+    def start_hosted_subscription(self, data: HostedSubscriptionCreate) -> tuple[Subscription, str]:
+        """Opens an agreement for the payer to authorise at Mercado Pago.
+
+        Refused for somebody who already has a live subscription. The card flow
+        can cancel the old agreement first because it learns immediately
+        whether the new one took; here the payer may simply close the tab, and
+        cancelling up front would leave them paying for nothing. Changing plan
+        keeps going through the card.
+        """
+        plan = self.get_plan(data.plan_id)
+        if not plan:
+            raise ValueError("plan_not_found")
+        if not self.webhook_url:
+            raise ValueError("subscription_webhook_url_not_configured")
+        if not self.back_url:
+            raise ValueError("back_url_not_configured")
+
+        # An agreement they opened and walked away from. Sending them back to
+        # the same one is what they meant by clicking again, and it costs the
+        # gateway nothing; only a different plan is worth starting over for.
+        pending = self._pending_subscription(data.user_id)
+        if pending:
+            resumed = self._resume_pending(pending, plan.id)
+            if resumed:
+                return resumed
+            self._discard_pending(data.user_id)
+
+        if self.live_subscription(data.user_id):
+            raise ValueError("already_subscribed")
+
+        sub = Subscription(
+            tenant=self.tenant,
+            plan_id=plan.id,
+            user_id=data.user_id,
+            gateway="mercadopago",
+            status="pending",
+        )
+        self.db.add(sub)
+        self.db.flush()
+        try:
+            result = self.mp.create_pending_subscription(
+                reason=plan.name,
+                payer_email=data.payer_email,
+                amount=float(plan.amount),
+                currency=plan.currency or "ARS",
+                back_url=self.back_url,
+                external_reference=str(sub.id),
+                notification_url=self.webhook_url,
+            )
+            init_point = result.get("init_point") or ""
+            if not init_point:
+                # Without somewhere to send the payer the row would sit pending
+                # for ever, so this counts as a failure, not a partial success.
+                raise ValueError("gateway_returned_no_init_point")
+            sub.gateway_subscription_id = result.get("id")
+            sub.status = result.get("status", "pending")
+        except (MercadopagoAPIException, ValueError):
+            self.db.rollback()
+            raise
+        self.db.commit()
+        self.db.refresh(sub)
+        return sub, init_point
+
+    def _resume_pending(self, pending: Subscription, plan_id: int) -> tuple[Subscription, str] | None:
+        """Sends the payer back to an agreement they already opened.
+
+        Returns None when there is nothing to go back to: a different plan, or
+        a gateway that has since moved the agreement on — including the case
+        where they did authorise it and only our row is behind, which the
+        status is corrected for here rather than left to the webhook.
+        """
+        if pending.plan_id != plan_id or not pending.gateway_subscription_id:
+            return None
+        try:
+            result = self.mp.get_subscription(pending.gateway_subscription_id)
+        except MercadopagoAPIException:
+            return None
+        status = result.get("status", "")
+        if status != "pending":
+            pending.status = status or pending.status
+            self._sync_subscription_dates(pending, result)
+            self.db.commit()
+            return None
+        init_point = result.get("init_point") or ""
+        return (pending, init_point) if init_point else None
+
+    def _pending_subscription(self, user_id: str) -> Subscription | None:
+        """An agreement opened but never authorised by the payer.
+
+        Hosted checkout leaves one behind whenever somebody closes the tab at
+        the gateway, which is most of the time. It is not a subscription — it
+        grants nothing — so it must never stand between them and paying.
+        """
+        return (
+            self.db.query(Subscription)
+            .filter(
+                Subscription.user_id == user_id,
+                Subscription.tenant == self.tenant,
+                Subscription.status == "pending",
+            )
+            .order_by(Subscription.created_at.desc())
+            .first()
+        )
+
+    def _discard_pending(self, user_id: str) -> None:
+        """Clears abandoned agreements so a payer can try again."""
+        pending = self._pending_subscription(user_id)
+        while pending:
+            if pending.gateway_subscription_id:
+                try:
+                    self.mp.cancel_subscription(pending.gateway_subscription_id)
+                except MercadopagoAPIException:
+                    # Already gone at the gateway, or unreachable. Either way an
+                    # agreement nobody authorised must not block this payer.
+                    pass
+            pending.status = "cancelled"
+            pending.cancelled_at = datetime.utcnow()
+            self.db.flush()
+            pending = self._pending_subscription(user_id)
 
     def _record_cancellation(self, gateway_subscription_id: str) -> None:
         stale = (
