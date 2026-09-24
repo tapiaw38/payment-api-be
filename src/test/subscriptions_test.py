@@ -13,6 +13,7 @@ from gateways.mercadopago.exceptions import MercadopagoAPIException
 from schemas.subscriptions import (
     BillingCycleCreate,
     HostedSubscriptionCreate,
+    PlanChangeCreate,
     PlanCreate,
     PlanResponse,
     SubscriptionCreate,
@@ -680,5 +681,64 @@ def test_cancelling_ends_the_agreement_now_and_keeps_the_paid_month():
         assert cancelled.status == "cancelled"
         assert mp.cancelled == ["preapproval-1"], "the gateway stops charging immediately"
         assert service.get_entitlement("teacher-1") is not None, "the paid month is kept"
+    finally:
+        db.close()
+
+
+class PlanChangeMercadoPago(ResumableMercadoPago):
+    def __init__(self):
+        super().__init__()
+        self.amounts: list[tuple[str, float]] = []
+
+    def update_subscription_amount(self, preapproval_id: str, amount: float, currency: str = "ARS") -> dict:
+        self.amounts.append((preapproval_id, amount))
+        return {"id": preapproval_id, "status": "authorized"}
+
+
+def _paying_db():
+    db = _two_plan_db()
+    sub = db.query(Subscription).filter(Subscription.user_id == "teacher-1").first()
+    sub.current_period_start = datetime.utcnow() - timedelta(days=15)
+    sub.current_period_end = datetime.utcnow() + timedelta(days=15)
+    db.commit()
+    return db
+
+
+def test_changing_plan_without_a_card_charges_nothing_now():
+    """Paying from a Mercado Pago balance leaves nothing to charge with.
+
+    The move still happens and the agreement is restated, so the new price
+    arrives at renewal. Refusing instead would strand every teacher who pays
+    from their balance on the plan they started with.
+    """
+    db = _paying_db()
+    mp = PlanChangeMercadoPago()
+    service = SubscriptionService(db, mp, webhook_url="https://hook", tenant="practiq")
+    target = db.query(Plan).order_by(Plan.id.desc()).first()
+    try:
+        sub, charged = service.change_plan(
+            PlanChangeCreate(plan_id=target.id, user_id="teacher-1", payer_email="t@example.com")
+        )
+        assert charged == Decimal("0.00"), charged
+        assert sub.plan_id == target.id, "the plan still moves"
+        assert mp.amounts == [("preapproval-old", 25000.0)], mp.amounts
+        assert mp.cancelled == [], "the agreement is restated, never replaced"
+    finally:
+        db.close()
+
+
+def test_changing_plan_keeps_one_agreement():
+    """Cancelling and recreating is what charged a whole new month."""
+    db = _paying_db()
+    mp = PlanChangeMercadoPago()
+    service = SubscriptionService(db, mp, webhook_url="https://hook", tenant="practiq")
+    target = db.query(Plan).order_by(Plan.id.desc()).first()
+    try:
+        before = db.query(Subscription).filter(Subscription.user_id == "teacher-1").count()
+        service.change_plan(
+            PlanChangeCreate(plan_id=target.id, user_id="teacher-1", payer_email="t@example.com")
+        )
+        after = db.query(Subscription).filter(Subscription.user_id == "teacher-1").count()
+        assert after == before, "no second subscription row, and no second charge"
     finally:
         db.close()

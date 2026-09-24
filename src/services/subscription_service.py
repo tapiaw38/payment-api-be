@@ -244,6 +244,10 @@ class SubscriptionService:
         # cannot: taking the difference and then failing to grant the plan
         # would need a refund, and refunds are somebody's afternoon.
         self.mp.update_subscription_amount(sub.gateway_subscription_id, float(new_amount), currency)
+        if owed > 0 and not (data.card_token_id and data.payment_method_id):
+            # Paying from a balance leaves us nothing to charge the difference
+            # with. The move still happens; the new price starts at renewal.
+            owed = Decimal("0.00")
         if owed > 0:
             try:
                 self._charge_difference(sub, data, owed, currency, plan.name)

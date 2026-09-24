@@ -81,10 +81,13 @@ class PlanChangeCreate(BaseModel):
     plan_id: int
     user_id: str
     payer_email: str
-    card_token_id: str
+    # Both optional: somebody paying from their Mercado Pago balance has no
+    # card to give, and the agreement already knows how to charge them. Without
+    # a card the difference is not taken now — the new price starts at renewal.
+    card_token_id: str | None = None
     # Mercado Pago will not take a one-off payment without it, and the token
     # does not carry it — the browser resolves it from the card's first digits.
-    payment_method_id: str
+    payment_method_id: str | None = None
 
 
 class PlanChangeResponse(BaseModel):
