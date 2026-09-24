@@ -153,6 +153,7 @@ class SubscriptionService:
             user_id=data.user_id,
             gateway="mercadopago",
             status="pending",
+            payer_email=data.payer_email,
         )
         self.db.add(sub)
         self.db.flush()
@@ -203,7 +204,7 @@ class SubscriptionService:
         # gateway nothing; only a different plan is worth starting over for.
         pending = self._pending_subscription(data.user_id)
         if pending:
-            resumed = self._resume_pending(pending, plan.id)
+            resumed = self._resume_pending(pending, plan.id, data.payer_email)
             if resumed:
                 return resumed
             self._discard_pending(data.user_id)
@@ -217,6 +218,7 @@ class SubscriptionService:
             user_id=data.user_id,
             gateway="mercadopago",
             status="pending",
+            payer_email=data.payer_email,
         )
         self.db.add(sub)
         self.db.flush()
@@ -244,7 +246,9 @@ class SubscriptionService:
         self.db.refresh(sub)
         return sub, init_point
 
-    def _resume_pending(self, pending: Subscription, plan_id: int) -> tuple[Subscription, str] | None:
+    def _resume_pending(
+        self, pending: Subscription, plan_id: int, payer_email: str
+    ) -> tuple[Subscription, str] | None:
         """Sends the payer back to an agreement they already opened.
 
         Returns None when there is nothing to go back to: a different plan, or
@@ -253,6 +257,10 @@ class SubscriptionService:
         status is corrected for here rather than left to the webhook.
         """
         if pending.plan_id != plan_id or not pending.gateway_subscription_id:
+            return None
+        # Asking again with a different address is how somebody corrects the
+        # one the gateway rejected. Sending them back would repeat the refusal.
+        if (pending.payer_email or "") != payer_email:
             return None
         try:
             result = self.mp.get_subscription(pending.gateway_subscription_id)

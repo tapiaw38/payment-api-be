@@ -561,3 +561,31 @@ def test_a_pending_row_catches_up_when_the_payer_did_authorise():
         assert mp.cancelled == [], "an authorised agreement must never be cancelled"
     finally:
         db.close()
+
+
+def test_correcting_the_email_opens_a_new_agreement():
+    """Mercado Pago refuses its checkout to anyone but the payer_email's owner.
+
+    Retyping the right address is how somebody recovers from that, so going
+    back to the agreement that already rejected them would be a dead end. It
+    never gives the address back, which is why the row keeps it.
+    """
+    db = _two_plan_db()
+    mp = ResumableMercadoPago()
+    plan = db.query(Plan).order_by(Plan.id).first()
+    try:
+        first, _ = _hosted_service(db, mp).start_hosted_subscription(
+            HostedSubscriptionCreate(
+                plan_id=plan.id, user_id="teacher-2", payer_email="practiq@example.com"
+            )
+        )
+        second, _ = _hosted_service(db, mp).start_hosted_subscription(
+            HostedSubscriptionCreate(
+                plan_id=plan.id, user_id="teacher-2", payer_email="mercadopago@example.com"
+            )
+        )
+        assert second.id != first.id, "a different address needs its own agreement"
+        assert mp.cancelled == ["preapproval-hosted"], "the rejected one must be cancelled"
+        assert second.payer_email == "mercadopago@example.com"
+    finally:
+        db.close()

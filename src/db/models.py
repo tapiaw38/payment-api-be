@@ -44,6 +44,10 @@ class Subscription(Base):
     gateway = Column(String(50), nullable=False, default="mercadopago")
     gateway_subscription_id = Column(String(255), nullable=True, index=True)
     status = Column(String(50), nullable=False, default="pending", index=True)
+    # Which account the gateway was told to bill. It never gives this back, and
+    # its hosted checkout refuses anyone else, so an agreement is only reusable
+    # for the address it was opened with.
+    payer_email = Column(String(255), nullable=True)
     current_period_start = Column(DateTime, nullable=True)
     current_period_end = Column(DateTime, nullable=True)
     cancel_at_period_end = Column(Integer, default=0)
