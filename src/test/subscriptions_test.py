@@ -61,8 +61,16 @@ def test_webhook_signature_requires_matching_hmac():
         digest = hmac.new(secret.encode(), manifest.encode(), hashlib.sha256).hexdigest()
         request = SimpleNamespace(headers={"x-request-id": request_id, "x-signature": f"ts={timestamp},v1={digest}"})
 
-        assert _validate_signature(request, data_id)
-        assert not _validate_signature(request, "ABC-124")
+        # Unpacked, not truth-tested: the function returns (valid, reason), and
+        # a non-empty tuple is always truthy — so `assert not _validate(...)`
+        # failed on a correct rejection while `assert _validate(...)` passed on
+        # anything at all.
+        valid, _ = _validate_signature(request, data_id)
+        assert valid
+
+        valid, reason = _validate_signature(request, "ABC-124")
+        assert not valid
+        assert reason == "signature_mismatch"
     finally:
         settings.mercadopago_webhook_secret = previous
 
