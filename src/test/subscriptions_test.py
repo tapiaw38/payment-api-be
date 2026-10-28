@@ -983,3 +983,193 @@ def test_changing_plan_keeps_one_agreement():
         assert after == before, "no second subscription row, and no second charge"
     finally:
         db.close()
+
+
+class PreapprovalLookupMercadoPago(NoopMercadoPago):
+    def __init__(self, status: str, date_approved: str, next_payment_date: str):
+        self.status = status
+        self.date_approved = date_approved
+        self.next_payment_date = next_payment_date
+
+    def get_subscription(self, preapproval_id: str) -> dict:
+        return {
+            "id": preapproval_id,
+            "status": self.status,
+            "date_approved": self.date_approved,
+            "next_payment_date": self.next_payment_date,
+        }
+
+
+def test_recurring_payment_creates_a_cycle_when_none_was_scheduled():
+    db = _subscription_db("authorized")
+    sub = db.query(Subscription).first()
+    sub.current_period_start = datetime(2026, 9, 24)
+    sub.current_period_end = datetime(2026, 10, 24)
+    db.commit()
+    mp = PreapprovalLookupMercadoPago(
+        status="authorized",
+        date_approved="2026-10-24T03:02:03.000-04:00",
+        next_payment_date="2026-11-24T03:02:03.000-04:00",
+    )
+    service = SubscriptionService(db, mp, tenant="practiq")
+    try:
+        before = db.query(BillingCycle).filter(BillingCycle.subscription_id == sub.id).count()
+        assert before == 0
+        cycle = service.sync_recurring_payment(
+            {
+                "preapproval_id": "preapproval-1",
+                "id": "payment-1",
+                "status": "approved",
+                "transaction_amount": 200.0,
+                "currency_id": "ARS",
+            }
+        )
+        assert cycle is not None
+        assert cycle.status == "approved"
+        assert cycle.amount == Decimal("200.0")
+        db.refresh(sub)
+        assert sub.current_period_end == datetime(2026, 11, 24, 3, 2, 3)
+        assert sub.next_payment_at == datetime(2026, 11, 24, 3, 2, 3)
+    finally:
+        db.close()
+
+
+def test_authorized_payment_creates_a_cycle_when_none_was_scheduled():
+    db = _subscription_db("authorized")
+    sub = db.query(Subscription).first()
+    db.commit()
+    mp = PreapprovalLookupMercadoPago(
+        status="authorized",
+        date_approved="2026-10-24T03:02:03.000-04:00",
+        next_payment_date="2026-11-24T03:02:03.000-04:00",
+    )
+    service = SubscriptionService(db, mp, tenant="practiq")
+    try:
+        cycle = service.sync_authorized_payment(
+            {
+                "preapproval_id": "preapproval-1",
+                "id": "authorized-payment-1",
+                "status": "approved",
+                "transaction_amount": 200.0,
+                "currency_id": "ARS",
+                "payment": {"id": "payment-1"},
+            }
+        )
+        assert cycle is not None
+        assert cycle.gateway_authorized_payment_id == "authorized-payment-1"
+        assert cycle.gateway_payment_id == "payment-1"
+        assert cycle.period_start == datetime(2026, 10, 24, 3, 2, 3)
+        assert cycle.period_end == datetime(2026, 11, 24, 3, 2, 3)
+    finally:
+        db.close()
+
+
+def test_recurring_payment_reuses_an_existing_pending_cycle():
+    db = _subscription_db("authorized")
+    sub = db.query(Subscription).first()
+    cycle = BillingCycle(
+        subscription_id=sub.id,
+        period_start=datetime(2026, 10, 24),
+        period_end=datetime(2026, 11, 24),
+        quantity=1,
+        unit_amount=Decimal("200"),
+        minimum_amount=Decimal("0"),
+        amount=Decimal("200"),
+        currency="ARS",
+        status="pending",
+    )
+    db.add(cycle)
+    db.commit()
+    mp = PreapprovalLookupMercadoPago(status="authorized", date_approved="x", next_payment_date="y")
+    service = SubscriptionService(db, mp, tenant="practiq")
+    try:
+        result = service.sync_recurring_payment(
+            {"preapproval_id": "preapproval-1", "id": "payment-1", "status": "approved"}
+        )
+        assert result.id == cycle.id
+        assert db.query(BillingCycle).filter(BillingCycle.subscription_id == sub.id).count() == 1
+    finally:
+        db.close()
+
+
+def test_authorized_and_payment_events_share_one_cycle_in_either_order():
+    for authorized_first in (True, False):
+        db = _subscription_db("authorized")
+        mp = PreapprovalLookupMercadoPago(
+            status="authorized",
+            date_approved="2026-09-24T02:49:15.000-04:00",
+            next_payment_date="2026-11-24T02:49:15.000-04:00",
+        )
+        service = SubscriptionService(db, mp, tenant="practiq")
+        authorized = {
+            "preapproval_id": "preapproval-1",
+            "id": "authorized-payment-1",
+            "status": "approved",
+            "transaction_amount": 200,
+            "currency_id": "ARS",
+            "debit_date": "2026-10-24T02:49:15.000-04:00",
+            "payment": {"id": "payment-1"},
+        }
+        payment = {
+            "preapproval_id": "preapproval-1",
+            "id": "payment-1",
+            "status": "approved",
+            "transaction_amount": 200,
+            "currency_id": "ARS",
+            "date_approved": "2026-10-24T02:49:15.000-04:00",
+        }
+        try:
+            if authorized_first:
+                service.sync_authorized_payment(authorized)
+                service.sync_recurring_payment(payment)
+            else:
+                service.sync_recurring_payment(payment)
+                service.sync_authorized_payment(authorized)
+            service.sync_authorized_payment(authorized)
+            service.sync_recurring_payment(payment)
+            cycles = db.query(BillingCycle).all()
+            assert len(cycles) == 1
+            assert cycles[0].gateway_authorized_payment_id == "authorized-payment-1"
+            assert cycles[0].gateway_payment_id == "payment-1"
+            assert cycles[0].period_start == datetime(2026, 10, 24, 2, 49, 15)
+            assert db.query(Subscription).one().current_period_start == cycles[0].period_start
+        finally:
+            db.close()
+
+
+def test_next_recurring_payment_opens_new_cycle_with_charge_date():
+    db = _subscription_db("authorized")
+    mp = PreapprovalLookupMercadoPago(
+        status="authorized",
+        date_approved="2026-09-24T02:49:15.000-04:00",
+        next_payment_date="2026-11-24T02:49:15.000-04:00",
+    )
+    service = SubscriptionService(db, mp, tenant="practiq")
+    try:
+        service.sync_recurring_payment(
+            {
+                "preapproval_id": "preapproval-1",
+                "id": "payment-1",
+                "status": "approved",
+                "transaction_amount": 200,
+                "date_approved": "2026-10-24T02:49:15.000-04:00",
+            }
+        )
+        mp.next_payment_date = "2026-12-24T02:49:15.000-04:00"
+        service.sync_recurring_payment(
+            {
+                "preapproval_id": "preapproval-1",
+                "id": "payment-2",
+                "status": "approved",
+                "transaction_amount": 200,
+                "date_approved": "2026-11-24T02:49:15.000-04:00",
+            }
+        )
+        cycles = db.query(BillingCycle).order_by(BillingCycle.period_start).all()
+        assert len(cycles) == 2
+        assert cycles[0].period_start == datetime(2026, 10, 24, 2, 49, 15)
+        assert cycles[1].period_start == datetime(2026, 11, 24, 2, 49, 15)
+        assert cycles[1].period_end == datetime(2026, 12, 24, 2, 49, 15)
+        assert db.query(Subscription).one().current_period_start == cycles[1].period_start
+    finally:
+        db.close()

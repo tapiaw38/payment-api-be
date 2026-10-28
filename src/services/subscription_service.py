@@ -914,6 +914,82 @@ class SubscriptionService:
         )
         return cycle
 
+    def _refresh_subscription_from_gateway(self, sub: Subscription) -> None:
+        if not sub.gateway_subscription_id:
+            return
+        data = self.mp.get_subscription(sub.gateway_subscription_id)
+        sub.status = data.get("status", sub.status)
+        self._sync_subscription_dates(sub, data)
+        self.db.commit()
+        self.db.refresh(sub)
+
+    def _open_cycle_for_charge(
+        self,
+        sub: Subscription,
+        statuses: tuple[str, ...],
+        amount: Decimal,
+        currency: str,
+        provider_data: dict,
+        authorized_payment_id: str | None = None,
+        payment_id: str | None = None,
+    ) -> BillingCycle:
+        if authorized_payment_id:
+            cycle = (
+                self.db.query(BillingCycle)
+                .filter(BillingCycle.gateway_authorized_payment_id == authorized_payment_id)
+                .first()
+            )
+            if cycle:
+                return cycle
+        if payment_id:
+            cycle = (
+                self.db.query(BillingCycle)
+                .filter(
+                    BillingCycle.subscription_id == sub.id,
+                    BillingCycle.gateway_payment_id == payment_id,
+                )
+                .first()
+            )
+            if cycle:
+                return cycle
+        cycle = (
+            self.db.query(BillingCycle)
+            .filter(BillingCycle.subscription_id == sub.id, BillingCycle.status.in_(statuses))
+            .order_by(BillingCycle.period_start.asc())
+            .first()
+        )
+        if cycle:
+            return cycle
+        previous_period_end = sub.current_period_end
+        self._refresh_subscription_from_gateway(sub)
+        period_start = self._as_datetime(
+            provider_data.get("debit_date")
+            or provider_data.get("date_approved")
+            or provider_data.get("date_created")
+        )
+        if not period_start and previous_period_end and sub.current_period_end and previous_period_end < sub.current_period_end:
+            period_start = previous_period_end
+        period_start = period_start or sub.current_period_start or sub.created_at
+        period_end = sub.current_period_end or period_start
+        if period_start >= period_end:
+            raise ValueError("invalid_billing_period")
+        sub.current_period_start = period_start
+        cycle = BillingCycle(
+            subscription_id=sub.id,
+            period_start=period_start,
+            period_end=period_end,
+            quantity=1,
+            unit_amount=amount,
+            minimum_amount=Decimal("0"),
+            amount=amount,
+            currency=currency,
+            status="pending",
+        )
+        self.db.add(cycle)
+        self.db.commit()
+        self.db.refresh(cycle)
+        return cycle
+
     def sync_authorized_payment(self, provider_data: dict) -> BillingCycle | None:
         subscription_id = provider_data.get("preapproval_id")
         if not subscription_id:
@@ -925,19 +1001,18 @@ class SubscriptionService:
         )
         if not sub:
             return None
-        cycle = (
-            self.db.query(BillingCycle)
-            .filter(BillingCycle.subscription_id == sub.id, BillingCycle.status == "pending")
-            .order_by(BillingCycle.period_start.asc())
-            .first()
-        )
-        if not cycle:
-            return None
-        cycle.gateway_authorized_payment_id = str(provider_data.get("id"))
-        cycle.status = provider_data.get("status", cycle.status)
+        amount = Decimal(str(provider_data.get("transaction_amount", "0")))
+        currency = provider_data.get("currency_id") or sub.plan.currency or "ARS"
         payment = provider_data.get("payment") or {}
-        if isinstance(payment, dict) and payment.get("id"):
-            cycle.gateway_payment_id = str(payment["id"])
+        payment_id = str(payment["id"]) if isinstance(payment, dict) and payment.get("id") else None
+        authorized_payment_id = str(provider_data["id"]) if provider_data.get("id") else None
+        cycle = self._open_cycle_for_charge(
+            sub, ("pending",), amount, currency, provider_data, authorized_payment_id, payment_id
+        )
+        cycle.gateway_authorized_payment_id = authorized_payment_id
+        cycle.status = provider_data.get("status", cycle.status)
+        if payment_id:
+            cycle.gateway_payment_id = payment_id
         self.db.commit()
         self.db.refresh(cycle)
         return cycle
@@ -954,15 +1029,13 @@ class SubscriptionService:
         )
         if not sub:
             return None
-        cycle = (
-            self.db.query(BillingCycle)
-            .filter(BillingCycle.subscription_id == sub.id, BillingCycle.status.in_(["pending", "scheduled"]))
-            .order_by(BillingCycle.period_start.asc())
-            .first()
+        amount = Decimal(str(provider_data.get("transaction_amount", "0")))
+        currency = provider_data.get("currency_id") or sub.plan.currency or "ARS"
+        payment_id = str(provider_data["id"]) if provider_data.get("id") else None
+        cycle = self._open_cycle_for_charge(
+            sub, ("pending", "scheduled"), amount, currency, provider_data, payment_id=payment_id
         )
-        if not cycle:
-            return None
-        cycle.gateway_payment_id = str(provider_data.get("id"))
+        cycle.gateway_payment_id = payment_id
         cycle.status = provider_data.get("status", cycle.status)
         self.db.commit()
         self.db.refresh(cycle)
