@@ -1,10 +1,14 @@
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
+import requests
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from db.models import BillingCycle, Plan, Subscription
+from db.models import BillingCycle, Payment, Plan, PlanChangeAttempt, Subscription
 from gateways.mercadopago.exceptions import MercadopagoAPIException
+from gateways.mercadopago.payment_models import PaymentCreate as GatewayPaymentCreate, PaymentPayer as GatewayPaymentPayer
+from gateways.mercadopago.payment_service import MercadopagoPaymentService
 from gateways.mercadopago.subscriptions_service import MercadopagoSubscriptionService
 from schemas.subscriptions import (
     BillingCycleCreate,
@@ -14,6 +18,10 @@ from schemas.subscriptions import (
     PlanUpdate,
     SubscriptionCreate,
 )
+
+
+class PlanChangeOutcomeUnknown(Exception):
+    pass
 
 
 class SubscriptionService:
@@ -113,6 +121,43 @@ class SubscriptionService:
             .first()
         )
 
+    def list_subscriptions_admin(self, status: str | None = None) -> list[dict]:
+        query = self.db.query(Subscription).filter(Subscription.tenant == self.tenant)
+        if status:
+            query = query.filter(Subscription.status == status)
+        rows = []
+        for sub in query.order_by(Subscription.created_at.desc()).all():
+            last_cycle = (
+                self.db.query(BillingCycle)
+                .filter(BillingCycle.subscription_id == sub.id)
+                .order_by(BillingCycle.period_start.desc())
+                .first()
+            )
+            rows.append(
+                {
+                    "id": sub.id,
+                    "user_id": sub.user_id,
+                    "payer_email": sub.payer_email,
+                    "plan_id": sub.plan_id,
+                    "plan_name": sub.plan.name,
+                    "status": sub.status,
+                    "current_period_end": sub.current_period_end,
+                    "next_payment_at": sub.next_payment_at,
+                    "created_at": sub.created_at,
+                    "last_cycle": None
+                    if not last_cycle
+                    else {
+                        "status": last_cycle.status,
+                        "amount": last_cycle.amount,
+                        "currency": last_cycle.currency,
+                        "period_start": last_cycle.period_start,
+                        "period_end": last_cycle.period_end,
+                        "gateway_payment_id": last_cycle.gateway_payment_id,
+                    },
+                }
+            )
+        return rows
+
     def create_subscription(self, data: SubscriptionCreate) -> Subscription:
         plan = self.get_plan(data.plan_id)
         if not plan:
@@ -157,7 +202,13 @@ class SubscriptionService:
             payer_email=data.payer_email,
         )
         self.db.add(sub)
-        self.db.flush()
+        try:
+            self.db.flush()
+        except IntegrityError:
+            self.db.rollback()
+            if cancelled_at_gateway:
+                self._record_cancellation(cancelled_at_gateway)
+            raise ValueError("already_subscribed_to_plan")
         try:
             result = self.mp.create_subscription(
                 preapproval_plan_id=plan.gateway_plan_id,
@@ -166,6 +217,7 @@ class SubscriptionService:
                 card_token_id=data.card_token_id,
                 external_reference=str(sub.id),
                 notification_url=self.webhook_url,
+                idempotency_key=f"sub-create:{sub.id}",
             )
             sub.gateway_subscription_id = result.get("id")
             sub.status = result.get("status", "pending")
@@ -226,11 +278,33 @@ class SubscriptionService:
         sub = self.live_subscription(data.user_id)
         if not sub or not sub.gateway_subscription_id:
             raise ValueError("no_live_subscription")
+        attempt = self._open_plan_change_attempt(sub.id)
+        if attempt:
+            if attempt.target_plan_id != plan.id:
+                raise PlanChangeOutcomeUnknown("plan_change_in_progress")
+            if attempt.state == "prepared":
+                if not (data.card_token_id and data.payment_method_id):
+                    raise PlanChangeOutcomeUnknown("plan_change_in_progress")
+                return self._execute_plan_change(sub, data, attempt, plan.name)
+            return self._reconcile_plan_change(sub, attempt)
         if sub.status not in ("authorized", "active"):
             # A paused agreement is not being charged; resuming it first is
             # what the teacher means, and it keeps the billing date honest.
             raise ValueError("subscription_not_active")
         if sub.plan_id == plan.id:
+            completed = (
+                self.db.query(PlanChangeAttempt)
+                .filter(
+                    PlanChangeAttempt.tenant == self.tenant,
+                    PlanChangeAttempt.subscription_id == sub.id,
+                    PlanChangeAttempt.target_plan_id == plan.id,
+                    PlanChangeAttempt.state == "complete",
+                )
+                .order_by(PlanChangeAttempt.id.desc())
+                .first()
+            )
+            if completed:
+                return sub, Decimal(completed.amount)
             raise ValueError("already_subscribed_to_plan")
 
         old_amount = Decimal(sub.plan.amount) if sub.plan else Decimal("0")
@@ -240,55 +314,208 @@ class SubscriptionService:
             old_amount, new_amount, sub.current_period_start, sub.current_period_end, datetime.utcnow()
         )
 
-        # The agreement moves first because it can be moved back. A charge
-        # cannot: taking the difference and then failing to grant the plan
-        # would need a refund, and refunds are somebody's afternoon.
-        self.mp.update_subscription_amount(sub.gateway_subscription_id, float(new_amount), currency)
         if owed > 0 and not (data.card_token_id and data.payment_method_id):
             # Paying from a balance leaves us nothing to charge the difference
             # with. The move still happens; the new price starts at renewal.
             owed = Decimal("0.00")
-        if owed > 0:
-            try:
-                self._charge_difference(sub, data, owed, currency, plan.name)
-            except MercadopagoAPIException:
-                self.mp.update_subscription_amount(
-                    sub.gateway_subscription_id, float(old_amount), currency
-                )
-                self.db.rollback()
-                raise
 
-        sub.plan_id = plan.id
+        if owed <= 0:
+            self.mp.update_subscription_amount(sub.gateway_subscription_id, float(new_amount), currency)
+            sub.plan_id = plan.id
+            self.db.commit()
+            self.db.refresh(sub)
+            return sub, owed
+
+        attempt = PlanChangeAttempt(
+            tenant=self.tenant,
+            subscription_id=sub.id,
+            source_plan_id=sub.plan_id,
+            target_plan_id=plan.id,
+            period_start=sub.current_period_start,
+            period_end=sub.current_period_end,
+            amount=owed,
+            target_amount=new_amount,
+            currency=currency,
+            state="prepared",
+        )
+        self.db.add(attempt)
+        try:
+            self.db.flush()
+            attempt.idempotency_key = f"plan-change:{attempt.id}"
+            attempt.external_reference = f"plan-change-attempt-{attempt.id}"
+            self.db.commit()
+        except IntegrityError:
+            self.db.rollback()
+            raise PlanChangeOutcomeUnknown("plan_change_in_progress")
+
+        return self._execute_plan_change(sub, data, attempt, plan.name)
+
+    def _execute_plan_change(
+        self, sub: Subscription, data: PlanChangeCreate, attempt: PlanChangeAttempt, plan_name: str
+    ) -> tuple[Subscription, Decimal]:
+        try:
+            self.mp.update_subscription_amount(
+                sub.gateway_subscription_id, float(attempt.target_amount), attempt.currency
+            )
+        except Exception:
+            attempt.state = "failed"
+            self.db.commit()
+            raise
+
+        attempt.state = "sending"
+        self.db.commit()
+        try:
+            result = self._charge_difference(data, attempt, plan_name)
+        except MercadopagoAPIException as exc:
+            if exc.status_code >= 500 or exc.status_code in (408, 409, 423, 429):
+                attempt.state = "unknown"
+                self.db.commit()
+                raise PlanChangeOutcomeUnknown("payment_outcome_unknown") from exc
+            attempt.state = "failed"
+            self.db.commit()
+            self.mp.update_subscription_amount(
+                sub.gateway_subscription_id, float(sub.plan.amount), attempt.currency
+            )
+            raise
+        except requests.RequestException as exc:
+            attempt.state = "unknown"
+            self.db.commit()
+            raise PlanChangeOutcomeUnknown("payment_outcome_unknown") from exc
+
+        if not self._payment_matches_attempt(attempt, result):
+            attempt.state = "unknown"
+            self.db.commit()
+            raise PlanChangeOutcomeUnknown("payment_outcome_unknown")
+        self._record_plan_change_result(attempt, result)
+        if attempt.state == "failed":
+            self.mp.update_subscription_amount(
+                sub.gateway_subscription_id, float(sub.plan.amount), attempt.currency
+            )
+            raise ValueError("payment_rejected")
+        if attempt.state != "charged":
+            raise PlanChangeOutcomeUnknown("payment_outcome_unknown")
+
+        return self._finish_plan_change(sub, attempt)
+
+    def _open_plan_change_attempt(self, subscription_id: int) -> PlanChangeAttempt | None:
+        return (
+            self.db.query(PlanChangeAttempt)
+            .filter(
+                PlanChangeAttempt.tenant == self.tenant,
+                PlanChangeAttempt.subscription_id == subscription_id,
+                PlanChangeAttempt.state.in_(("prepared", "sending", "unknown", "charged")),
+            )
+            .first()
+        )
+
+    def _record_plan_change_result(self, attempt: PlanChangeAttempt, result: dict) -> None:
+        attempt.gateway_payment_id = str(result.get("id")) if result.get("id") else None
+        attempt.gateway_status = result.get("status")
+        if attempt.gateway_status in ("approved", "accredited"):
+            attempt.state = "charged"
+        elif attempt.gateway_status in ("rejected", "cancelled"):
+            attempt.state = "failed"
+        else:
+            attempt.state = "unknown"
+        self.db.commit()
+
+    @staticmethod
+    def _payment_matches_attempt(attempt: PlanChangeAttempt, result: dict) -> bool:
+        try:
+            amount = Decimal(str(result["transaction_amount"])).quantize(Decimal("0.01"))
+        except (KeyError, ValueError, TypeError):
+            return False
+        return (
+            bool(result.get("id"))
+            and amount == Decimal(attempt.amount)
+            and result.get("currency_id") == attempt.currency
+            and result.get("external_reference") == attempt.external_reference
+        )
+
+    def _reconcile_plan_change(
+        self, sub: Subscription, attempt: PlanChangeAttempt
+    ) -> tuple[Subscription, Decimal]:
+        if attempt.state == "charged":
+            return self._finish_plan_change(sub, attempt)
+        gateway = MercadopagoPaymentService(access_token=self.mp.access_token)
+        try:
+            payments = gateway.find_payments_by_reference(attempt.external_reference)
+        except (MercadopagoAPIException, requests.RequestException) as exc:
+            raise PlanChangeOutcomeUnknown("payment_outcome_unknown") from exc
+        if len(payments) != 1:
+            attempt.state = "unknown"
+            self.db.commit()
+            raise PlanChangeOutcomeUnknown("payment_outcome_unknown")
+        result = payments[0]
+        if not self._payment_matches_attempt(attempt, result):
+            raise PlanChangeOutcomeUnknown("payment_outcome_unknown")
+        self._record_plan_change_result(attempt, result)
+        if attempt.state == "charged":
+            return self._finish_plan_change(sub, attempt)
+        if attempt.state == "failed":
+            self.mp.update_subscription_amount(sub.gateway_subscription_id, float(sub.plan.amount), attempt.currency)
+            raise ValueError("payment_rejected")
+        raise PlanChangeOutcomeUnknown("payment_outcome_unknown")
+
+    def _finish_plan_change(
+        self, sub: Subscription, attempt: PlanChangeAttempt
+    ) -> tuple[Subscription, Decimal]:
+        attempt = (
+            self.db.query(PlanChangeAttempt)
+            .filter(PlanChangeAttempt.id == attempt.id, PlanChangeAttempt.tenant == self.tenant)
+            .populate_existing()
+            .with_for_update()
+            .one()
+        )
+        if attempt.state == "complete":
+            return sub, Decimal(attempt.amount)
+        if attempt.state != "charged":
+            raise PlanChangeOutcomeUnknown("payment_outcome_unknown")
+        self.mp.update_subscription_amount(
+            sub.gateway_subscription_id, float(attempt.target_amount), attempt.currency
+        )
+        payment = (
+            self.db.query(Payment)
+            .filter(Payment.tenant == self.tenant, Payment.external_reference == attempt.external_reference)
+            .first()
+        )
+        if not payment:
+            self.db.add(
+                Payment(
+                    tenant=self.tenant,
+                    gateway="mercadopago",
+                    gateway_payment_id=attempt.gateway_payment_id,
+                    amount=attempt.amount,
+                    currency=attempt.currency,
+                    status=attempt.gateway_status,
+                    user_id=sub.user_id,
+                    external_reference=attempt.external_reference,
+                    description="Diferencia por cambio de plan",
+                )
+            )
+        sub.plan_id = attempt.target_plan_id
+        attempt.state = "complete"
         self.db.commit()
         self.db.refresh(sub)
-        return sub, owed
+        return sub, Decimal(attempt.amount)
 
     def _charge_difference(
         self,
-        sub: Subscription,
         data: PlanChangeCreate,
-        amount: Decimal,
-        currency: str,
+        attempt: PlanChangeAttempt,
         plan_name: str,
-    ) -> None:
-        from services.payment_service import PaymentService
-        from gateways.mercadopago.payments_service import MercadopagoPaymentService
-        from schemas.payments import PaymentCreate, PaymentPayer
-
-        payments = PaymentService(
-            db=self.db,
-            mp_payment=MercadopagoPaymentService(access_token=self.mp.access_token),
-        )
-        payments.create_payment(
-            PaymentCreate(
-                transaction_amount=float(amount),
+    ) -> dict:
+        gateway = MercadopagoPaymentService(access_token=self.mp.access_token)
+        return gateway.create_payment(
+            GatewayPaymentCreate(
+                transaction_amount=float(attempt.amount),
                 token=data.card_token_id,
                 payment_method_id=data.payment_method_id,
-                payer=PaymentPayer(email=data.payer_email),
+                payer=GatewayPaymentPayer(email=data.payer_email),
                 description=f"Diferencia por pasar a {plan_name}",
-                external_reference=f"plan-change-{sub.id}",
-                user_id=sub.user_id,
-            )
+                external_reference=attempt.external_reference,
+            ),
+            idempotency_key=attempt.idempotency_key,
         )
 
     def start_hosted_subscription(self, data: HostedSubscriptionCreate) -> tuple[Subscription, str]:
@@ -330,7 +557,11 @@ class SubscriptionService:
             payer_email=data.payer_email,
         )
         self.db.add(sub)
-        self.db.flush()
+        try:
+            self.db.flush()
+        except IntegrityError:
+            self.db.rollback()
+            raise ValueError("already_subscribed")
         try:
             result = self.mp.create_pending_subscription(
                 reason=plan.name,
@@ -340,6 +571,7 @@ class SubscriptionService:
                 back_url=self.back_url,
                 external_reference=str(sub.id),
                 notification_url=self.webhook_url,
+                idempotency_key=f"sub-create:{sub.id}",
             )
             init_point = result.get("init_point") or ""
             if not init_point:

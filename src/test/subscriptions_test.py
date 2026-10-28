@@ -2,12 +2,15 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+import requests
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from api.v1.routers.webhooks import _validate_signature
 from config.settings import settings
-from db.models import BillingCycle, Plan, Subscription
+from db.models import BillingCycle, Payment, Plan, PlanChangeAttempt, Subscription
 from db.session import Base
 from gateways.mercadopago.exceptions import MercadopagoAPIException
 from schemas.subscriptions import (
@@ -18,7 +21,7 @@ from schemas.subscriptions import (
     PlanResponse,
     SubscriptionCreate,
 )
-from services.subscription_service import SubscriptionService
+from services.subscription_service import PlanChangeOutcomeUnknown, SubscriptionService
 
 
 class NoopMercadoPago:
@@ -170,16 +173,16 @@ def test_billing_history_is_scoped_ordered_and_limited():
     Base.metadata.create_all(engine)
     db = sessionmaker(bind=engine)()
     try:
-        for tenant, user_id, amount in (
-            ("practiq", "teacher-1", "100"),
-            ("practiq", "teacher-1", "200"),
-            ("practiq", "teacher-2", "300"),
-            ("other", "teacher-1", "400"),
+        for tenant, user_id, amount, status in (
+            ("practiq", "teacher-1", "100", "cancelled"),
+            ("practiq", "teacher-1", "200", "authorized"),
+            ("practiq", "teacher-2", "300", "authorized"),
+            ("other", "teacher-1", "400", "authorized"),
         ):
             plan = Plan(tenant=tenant, name="Plan", amount=Decimal("100"), interval="month")
             db.add(plan)
             db.flush()
-            subscription = Subscription(tenant=tenant, plan_id=plan.id, user_id=user_id)
+            subscription = Subscription(tenant=tenant, plan_id=plan.id, user_id=user_id, status=status)
             db.add(subscription)
             db.flush()
             db.add(
@@ -347,6 +350,7 @@ class SwitchRecordingMercadoPago:
         self.cancelled: list[str] = []
         self.created = 0
         self.fail_create = fail_create
+        self.idempotency_keys: list[str | None] = []
 
     def cancel_subscription(self, preapproval_id: str) -> dict:
         self.cancelled.append(preapproval_id)
@@ -356,6 +360,7 @@ class SwitchRecordingMercadoPago:
         if self.fail_create:
             raise MercadopagoAPIException(_DeclinedResponse())
         self.created += 1
+        self.idempotency_keys.append(kwargs.get("idempotency_key"))
         return {"id": "preapproval-new", "status": "authorized"}
 
 
@@ -443,6 +448,44 @@ def test_subscribing_again_to_the_same_plan_is_refused():
         assert mp.cancelled == [], "nothing may be cancelled"
         assert mp.created == 0
     finally:
+        db.close()
+
+
+def test_creating_a_subscription_sends_a_stable_idempotency_key():
+    db = _two_plan_db()
+    mp = SwitchRecordingMercadoPago()
+    service = SubscriptionService(db, mp, webhook_url="https://hook", tenant="practiq")
+    target = db.query(Plan).order_by(Plan.id.desc()).first()
+    try:
+        sub = service.create_subscription(
+            SubscriptionCreate(
+                plan_id=target.id, user_id="teacher-2", payer_email="t2@example.com", card_token_id="tok"
+            )
+        )
+        assert mp.idempotency_keys == [f"sub-create:{sub.id}"]
+    finally:
+        db.close()
+
+
+def test_two_live_subscriptions_for_the_same_user_are_rejected_by_the_database():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    plan = Plan(tenant="practiq", name="Equipo", amount=Decimal("25000"), interval="month")
+    db.add(plan)
+    db.flush()
+    db.add(Subscription(tenant="practiq", plan_id=plan.id, user_id="teacher-1", status="pending"))
+    db.commit()
+    try:
+        db.add(Subscription(tenant="practiq", plan_id=plan.id, user_id="teacher-1", status="authorized"))
+        raised = False
+        try:
+            db.flush()
+        except IntegrityError:
+            raised = True
+        assert raised, "a second live row for the same user must be rejected"
+    finally:
+        db.rollback()
         db.close()
 
 
@@ -706,6 +749,159 @@ def test_proration_of_an_expired_period_owes_nothing():
         Decimal("100"), Decimal("200"), start, end, datetime(2026, 10, 25)
     )
     assert owed == Decimal("0.00"), owed
+
+
+class PlanChangeSubscriptionGateway:
+    access_token = "test-token"
+
+    def __init__(self):
+        self.amounts = []
+
+    def update_subscription_amount(self, subscription_id, amount, currency):
+        self.amounts.append((subscription_id, amount, currency))
+
+
+class PlanChangePaymentGateway:
+    def __init__(self):
+        self.charges = []
+        self.search_results = []
+        self.timeout = False
+
+    def create_payment(self, data, idempotency_key):
+        self.charges.append((data, idempotency_key))
+        result = {
+            "id": "mp-payment-1",
+            "status": "approved",
+            "transaction_amount": data.transaction_amount,
+            "currency_id": "ARS",
+            "external_reference": data.external_reference,
+        }
+        if self.timeout:
+            self.search_results = [result]
+            raise requests.Timeout("response lost")
+        return result
+
+    def find_payments_by_reference(self, reference):
+        return [row for row in self.search_results if row["external_reference"] == reference]
+
+
+def plan_change_fixture(monkeypatch):
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    old = Plan(tenant="practiq", name="Inicial", amount=Decimal("100"), currency="ARS", interval="month")
+    target = Plan(tenant="practiq", name="Equipo", amount=Decimal("200"), currency="ARS", interval="month")
+    db.add_all([old, target])
+    db.flush()
+    sub = Subscription(
+        tenant="practiq",
+        plan_id=old.id,
+        user_id="teacher-1",
+        status="authorized",
+        gateway_subscription_id="mp-sub-1",
+        current_period_start=datetime.utcnow() - timedelta(days=15),
+        current_period_end=datetime.utcnow() + timedelta(days=15),
+    )
+    db.add(sub)
+    db.commit()
+    subscription_gateway = PlanChangeSubscriptionGateway()
+    payment_gateway = PlanChangePaymentGateway()
+    monkeypatch.setattr(
+        "services.subscription_service.MercadopagoPaymentService",
+        lambda access_token: payment_gateway,
+    )
+    service = SubscriptionService(db, subscription_gateway, tenant="practiq")
+    input_data = PlanChangeCreate(
+        plan_id=target.id,
+        user_id="teacher-1",
+        payer_email="teacher@example.com",
+        card_token_id="card-token-1",
+        payment_method_id="visa",
+    )
+    return engine, db, service, payment_gateway, input_data
+
+
+def test_change_plan_recovers_lost_payment_response_without_second_charge(monkeypatch):
+    engine, db, service, gateway, input_data = plan_change_fixture(monkeypatch)
+    gateway.timeout = True
+    try:
+        with pytest.raises(PlanChangeOutcomeUnknown):
+            service.change_plan(input_data)
+        attempt = db.query(PlanChangeAttempt).one()
+        assert attempt.state == "unknown"
+        assert attempt.tenant == "practiq"
+        assert attempt.subscription_id == db.query(Subscription).one().id
+        assert attempt.target_plan_id == input_data.plan_id
+        assert attempt.period_end is not None
+        assert attempt.amount > 0
+        assert gateway.charges[0][1] == attempt.idempotency_key
+
+        gateway.timeout = False
+        sub, charged = service.change_plan(input_data)
+        assert sub.plan_id == input_data.plan_id
+        assert charged == attempt.amount
+        assert attempt.state == "complete"
+        assert len(gateway.charges) == 1
+        assert db.query(Payment).count() == 1
+
+        _, repeated_amount = service.change_plan(input_data)
+        assert repeated_amount == charged
+        assert len(gateway.charges) == 1
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_change_plan_blocks_new_charge_when_previous_outcome_is_unknown(monkeypatch):
+    engine, db, service, gateway, input_data = plan_change_fixture(monkeypatch)
+    gateway.timeout = True
+    try:
+        with pytest.raises(PlanChangeOutcomeUnknown):
+            service.change_plan(input_data)
+        gateway.search_results = []
+        gateway.timeout = False
+        with pytest.raises(PlanChangeOutcomeUnknown):
+            service.change_plan(input_data.copy(update={"card_token_id": "card-token-2"}))
+        assert len(gateway.charges) == 1
+        assert db.query(PlanChangeAttempt).one().state == "unknown"
+        assert db.query(Subscription).one().plan_id != input_data.plan_id
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_change_plan_reuses_prepared_attempt_after_interruption(monkeypatch):
+    engine, db, service, gateway, input_data = plan_change_fixture(monkeypatch)
+    sub = db.query(Subscription).one()
+    target = db.query(Plan).filter(Plan.id == input_data.plan_id).one()
+    attempt = PlanChangeAttempt(
+        tenant="practiq",
+        subscription_id=sub.id,
+        source_plan_id=sub.plan_id,
+        target_plan_id=target.id,
+        period_start=sub.current_period_start,
+        period_end=sub.current_period_end,
+        amount=Decimal("50.00"),
+        target_amount=target.amount,
+        currency="ARS",
+        state="prepared",
+    )
+    db.add(attempt)
+    db.flush()
+    attempt.idempotency_key = f"plan-change:{attempt.id}"
+    attempt.external_reference = f"plan-change-attempt-{attempt.id}"
+    db.commit()
+    try:
+        changed, charged = service.change_plan(input_data)
+        assert changed.plan_id == target.id
+        assert charged == Decimal("50.00")
+        assert attempt.state == "complete"
+        assert len(gateway.charges) == 1
+        assert gateway.charges[0][1] == attempt.idempotency_key
+        assert db.query(PlanChangeAttempt).count() == 1
+    finally:
+        db.close()
+        engine.dispose()
 
 
 def test_cancelling_ends_the_agreement_now_and_keeps_the_paid_month():

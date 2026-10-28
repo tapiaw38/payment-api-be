@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Column, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import relationship
 
 from .session import Base
@@ -36,6 +36,16 @@ class Plan(Base):
 
 class Subscription(Base):
     __tablename__ = "subscriptions"
+    __table_args__ = (
+        Index(
+            "uq_subscriptions_live_per_user",
+            "tenant",
+            "user_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending', 'authorized', 'active', 'paused')"),
+            sqlite_where=text("status IN ('pending', 'authorized', 'active', 'paused')"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     tenant = Column(String(64), nullable=False, index=True, server_default="default")
@@ -121,6 +131,41 @@ class BillingCycle(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     subscription = relationship("Subscription")
+
+
+class PlanChangeAttempt(Base):
+    __tablename__ = "plan_change_attempts"
+
+    id = Column(Integer, primary_key=True)
+    tenant = Column(String(64), nullable=False, index=True)
+    subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=False, index=True)
+    source_plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
+    target_plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
+    period_start = Column(DateTime, nullable=True)
+    period_end = Column(DateTime, nullable=False)
+    amount = Column(Numeric(14, 2), nullable=False)
+    target_amount = Column(Numeric(14, 2), nullable=False)
+    currency = Column(String(3), nullable=False)
+    state = Column(String(20), nullable=False, default="prepared")
+    idempotency_key = Column(String(64), nullable=True)
+    external_reference = Column(String(255), nullable=True)
+    gateway_payment_id = Column(String(255), nullable=True)
+    gateway_status = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("uq_plan_change_attempts_idempotency_key", "idempotency_key", unique=True),
+        Index("uq_plan_change_attempts_external_reference", "external_reference", unique=True),
+        Index(
+            "uq_open_plan_change_attempt",
+            "tenant",
+            "subscription_id",
+            unique=True,
+            postgresql_where=text("state IN ('prepared', 'sending', 'unknown', 'charged')"),
+            sqlite_where=text("state IN ('prepared', 'sending', 'unknown', 'charged')"),
+        ),
+    )
 
 
 class WebhookEvent(Base):

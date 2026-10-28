@@ -1,6 +1,7 @@
 import uuid
 import requests
 from typing import Any
+from urllib.parse import quote
 
 from .exceptions import MercadopagoAPIException
 from .models import TokenDataInput
@@ -40,7 +41,7 @@ class MercadopagoPaymentService:
             return {}
         return response.json()
 
-    def create_payment(self, data: PaymentCreate) -> dict[str, Any]:
+    def create_payment(self, data: PaymentCreate, idempotency_key: str | None = None) -> dict[str, Any]:
         # When using a customer card (type="customer" + id), MP expects ONLY type+id in payer,
         # not email. Including email alongside type+id causes 500 internal_error.
         if data.payer.type == "customer" and data.payer.id:
@@ -68,10 +69,17 @@ class MercadopagoPaymentService:
             body["external_reference"] = data.external_reference
         import json as _json
         print(f"[DEBUG] MP /payments request body: {_json.dumps(body)}", flush=True)
-        return self._send_request("POST", "/payments", json_body=body, idempotency_key=str(uuid.uuid4()))
+        return self._send_request("POST", "/payments", json_body=body, idempotency_key=idempotency_key or str(uuid.uuid4()))
 
     def get_payment(self, payment_id: int | str) -> dict[str, Any]:
         return self._send_request("GET", f"/payments/{payment_id}")
+
+    def find_payments_by_reference(self, external_reference: str) -> list[dict[str, Any]]:
+        response = self._send_request(
+            "GET",
+            f"/payments/search?external_reference={quote(external_reference, safe='')}&sort=date_created&criteria=desc",
+        )
+        return [payment for payment in response.get("results", []) if payment.get("external_reference") == external_reference]
 
     def get_or_create_customer(self, email: str) -> str:
         """Find existing MP customer by email or create new one. Returns customer_id."""

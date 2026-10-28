@@ -7,6 +7,7 @@ from config.settings import settings
 from gateways.mercadopago.exceptions import MercadopagoAPIException
 from gateways.mercadopago.subscriptions_service import MercadopagoSubscriptionService
 from schemas.subscriptions import (
+    AdminSubscriptionResponse,
     BillingCycleCreate,
     BillingCycleResponse,
     EntitlementResponse,
@@ -20,7 +21,7 @@ from schemas.subscriptions import (
     SubscriptionCreate,
     SubscriptionResponse,
 )
-from services.subscription_service import SubscriptionService
+from services.subscription_service import PlanChangeOutcomeUnknown, SubscriptionService
 from sqlalchemy.orm import Session
 
 router = APIRouter()
@@ -130,6 +131,8 @@ def change_plan(
         return PlanChangeResponse(
             subscription_id=sub.id, plan_id=sub.plan_id, status=sub.status, charged=float(charged)
         )
+    except PlanChangeOutcomeUnknown as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e.args[0]))
     except MercadopagoAPIException as e:
@@ -165,6 +168,14 @@ def start_hosted_subscription(
             e.error_msg,
         )
         raise HTTPException(status_code=e.status_code, detail={"code": e.error_code, "message": e.error_msg})
+
+
+@router.get("/subscriptions/admin", response_model=list[AdminSubscriptionResponse])
+def list_subscriptions_admin(
+    status: str | None = None,
+    service: SubscriptionService = Depends(_service),
+):
+    return service.list_subscriptions_admin(status=status)
 
 
 @router.get("/subscriptions/{subscription_id}", response_model=SubscriptionResponse)

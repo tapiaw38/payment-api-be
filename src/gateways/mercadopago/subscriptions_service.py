@@ -10,11 +10,14 @@ class MercadopagoSubscriptionService:
         self.access_token = access_token
         self.base_url = "https://api.mercadopago.com"
 
-    def _headers(self) -> dict[str, str]:
-        return {
+    def _headers(self, idempotency_key: str | None = None) -> dict[str, str]:
+        headers = {
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json",
         }
+        if idempotency_key:
+            headers["X-Idempotency-Key"] = idempotency_key
+        return headers
 
     def _send_request(
         self,
@@ -22,9 +25,10 @@ class MercadopagoSubscriptionService:
         path: str,
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
-        kwargs = {"headers": self._headers(), "timeout": 30}
+        kwargs = {"headers": self._headers(idempotency_key), "timeout": 30}
         if json_body is not None:
             kwargs["json"] = json_body
         if params:
@@ -116,6 +120,7 @@ class MercadopagoSubscriptionService:
         card_token_id: str,
         external_reference: str | None = None,
         notification_url: str | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         body = {
             "preapproval_plan_id": preapproval_plan_id,
@@ -128,7 +133,7 @@ class MercadopagoSubscriptionService:
             body["external_reference"] = external_reference
         if notification_url:
             body["notification_url"] = notification_url
-        return self._send_request("POST", "/preapproval", json_body=body)
+        return self._send_request("POST", "/preapproval", json_body=body, idempotency_key=idempotency_key)
 
     def create_pending_subscription(
         self,
@@ -141,6 +146,7 @@ class MercadopagoSubscriptionService:
         currency: str = "ARS",
         frequency: int = 1,
         frequency_type: str = "months",
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Opens an agreement the payer authorises at Mercado Pago.
 
@@ -168,7 +174,7 @@ class MercadopagoSubscriptionService:
             body["external_reference"] = external_reference
         if notification_url:
             body["notification_url"] = notification_url
-        return self._send_request("POST", "/preapproval", json_body=body)
+        return self._send_request("POST", "/preapproval", json_body=body, idempotency_key=idempotency_key)
 
     def get_subscription(self, preapproval_id: str) -> dict[str, Any]:
         return self._send_request("GET", f"/preapproval/{preapproval_id}")

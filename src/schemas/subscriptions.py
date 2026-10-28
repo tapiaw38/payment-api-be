@@ -161,6 +161,28 @@ class BillingCycleResponse(BaseModel):
         orm_mode = True
 
 
+class AdminBillingCycleSummary(BaseModel):
+    status: str
+    amount: Decimal
+    currency: str
+    period_start: datetime
+    period_end: datetime
+    gateway_payment_id: str | None
+
+
+class AdminSubscriptionResponse(BaseModel):
+    id: int
+    user_id: str
+    payer_email: str | None
+    plan_id: int
+    plan_name: str
+    status: str
+    current_period_end: datetime | None
+    next_payment_at: datetime | None
+    created_at: datetime
+    last_cycle: AdminBillingCycleSummary | None
+
+
 class EntitlementResponse(BaseModel):
     user_id: str
     active: bool

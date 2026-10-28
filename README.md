@@ -66,7 +66,7 @@ The API will be available at **`http://localhost:8008`**.
 
 - **MercadoPago** (pre-purchase): `/api/v1/mercadopago/` — payment_methods, installments, identification_types, token.
 - **Payments (one-time charge)**: `/api/v1/payments/` — POST create payment (token, amount, payment method, payer), GET payment by id.
-- **Subscriptions**: `/api/v1/subscriptions/` — plans, subscriptions, monthly billing cycles and deferred cancellation reconciliation.
+- **Subscriptions**: `/api/v1/subscriptions/` — plans, subscriptions and monthly billing cycles.
 - **Webhooks**: `/api/v1/webhooks/mercadopago` — signed MercadoPago notifications. Delivery IDs are persisted to make retries idempotent.
 
 ### Recurring billing
@@ -75,7 +75,7 @@ A `Plan` defines catalog pricing. A `BillingCycle` records immutable monthly usa
 
 Set `MP_SUBSCRIPTION_WEBHOOK_URL` to this service's public HTTPS endpoint. It is sent to MercadoPago for every subscription; caller-supplied notification URLs are ignored.
 
-Run `python -m jobs.reconcile_cancellations` daily from Cron, Kubernetes CronJob or systemd timer. Equivalent protected endpoint: `POST /subscriptions/reconcile-cancellations`. It cancels subscriptions previously marked `at_period_end` only after their paid period expires.
+A failed recurring charge is retried by Mercado Pago itself, on its own schedule, against the `preapproval` agreement — this service does not run its own retry job. Each attempt arrives as a `subscription_authorized_payment`/`payment` webhook and is recorded on the matching `BillingCycle`.
 
 The academic backend can ask `GET /subscriptions/subscriptions/user/{user_id}/entitlement` before granting paid features. This is service-to-service API, protected by `PAYMENTS_API_KEY` in production.
 
