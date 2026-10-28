@@ -7,7 +7,7 @@ from sqlalchemy.orm import sessionmaker
 
 from api.v1.routers.webhooks import _validate_signature
 from config.settings import settings
-from db.models import Plan, Subscription
+from db.models import BillingCycle, Plan, Subscription
 from db.session import Base
 from gateways.mercadopago.exceptions import MercadopagoAPIException
 from schemas.subscriptions import (
@@ -163,6 +163,51 @@ def test_a_product_cannot_read_another_products_rows():
         assert practiq.get_subscription(yego_subscription_id) is None
     finally:
         db.close()
+
+
+def test_billing_history_is_scoped_ordered_and_limited():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine)()
+    try:
+        for tenant, user_id, amount in (
+            ("practiq", "teacher-1", "100"),
+            ("practiq", "teacher-1", "200"),
+            ("practiq", "teacher-2", "300"),
+            ("other", "teacher-1", "400"),
+        ):
+            plan = Plan(tenant=tenant, name="Plan", amount=Decimal("100"), interval="month")
+            db.add(plan)
+            db.flush()
+            subscription = Subscription(tenant=tenant, plan_id=plan.id, user_id=user_id)
+            db.add(subscription)
+            db.flush()
+            db.add(
+                BillingCycle(
+                    subscription_id=subscription.id,
+                    period_start=datetime(2026, 1, 1) + timedelta(days=int(amount)),
+                    period_end=datetime(2026, 2, 1) + timedelta(days=int(amount)),
+                    quantity=1,
+                    unit_amount=Decimal(amount),
+                    minimum_amount=Decimal("0"),
+                    amount=Decimal(amount),
+                    currency="ARS",
+                    status="approved",
+                )
+            )
+        db.commit()
+
+        service = SubscriptionService(db, NoopMercadoPago(), tenant="practiq")
+        assert [cycle.amount for cycle in service.list_billing_cycles_for_user("teacher-1")] == [
+            Decimal("200"),
+            Decimal("100"),
+        ]
+        assert [cycle.amount for cycle in service.list_billing_cycles_for_user("teacher-1", limit=1)] == [
+            Decimal("200")
+        ]
+    finally:
+        db.close()
+        engine.dispose()
 
 
 class RecordingMercadoPago:

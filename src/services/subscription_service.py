@@ -455,6 +455,16 @@ class SubscriptionService:
             .all()
         )
 
+    def list_billing_cycles_for_user(self, user_id: str, limit: int = 24) -> list[BillingCycle]:
+        return (
+            self.db.query(BillingCycle)
+            .join(Subscription)
+            .filter(Subscription.user_id == user_id, Subscription.tenant == self.tenant)
+            .order_by(BillingCycle.period_start.desc(), BillingCycle.id.desc())
+            .limit(limit)
+            .all()
+        )
+
     # Statuses that mean somebody is entitled right now. Paused and cancelled
     # are in because the period they already paid for does not stop being paid
     # for: pausing on the 9th, covered to the 24th, used to cost two weeks of

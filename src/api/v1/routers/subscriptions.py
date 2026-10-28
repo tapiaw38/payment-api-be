@@ -186,6 +186,14 @@ def list_subscriptions_by_user(
     return service.get_subscription_by_user(user_id)
 
 
+@router.get("/subscriptions/user/{user_id}/billing-cycles", response_model=list[BillingCycleResponse])
+def list_billing_cycles_by_user(
+    user_id: str,
+    service: SubscriptionService = Depends(_service),
+):
+    return service.list_billing_cycles_for_user(user_id)
+
+
 @router.get("/subscriptions/user/{user_id}/entitlement", response_model=EntitlementResponse)
 def get_entitlement(user_id: str, service: SubscriptionService = Depends(_service)):
     subscription = service.get_entitlement(user_id)
