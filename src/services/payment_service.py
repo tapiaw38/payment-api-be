@@ -215,26 +215,38 @@ class PaymentService:
             query = query.filter(Payment.user_id == user_id)
         return query.first()
 
+    def _rows_for_gateway_payment(self, gateway_payment_id: str) -> list[Payment]:
+        return (
+            self._scoped(
+                self.db.query(Payment).filter(Payment.gateway_payment_id == gateway_payment_id)
+            )
+            .order_by(Payment.id)
+            .all()
+        )
+
     def get_payment_by_gateway_id(self, gateway_payment_id: str) -> Payment | None:
-        return self._scoped(
-            self.db.query(Payment).filter(Payment.gateway_payment_id == gateway_payment_id)
-        ).first()
+        rows = self._rows_for_gateway_payment(gateway_payment_id)
+        return rows[0] if rows else None
 
     def update_payment_status(self, gateway_payment_id: str, status: str) -> Payment | None:
-        payment = self.get_payment_by_gateway_id(gateway_payment_id)
-        if not payment:
+        payments = self._rows_for_gateway_payment(gateway_payment_id)
+        if not payments:
             return None
         if not status:
-            return payment
-        if payment.status in SETTLED_STATUSES and status not in SETTLED_STATUSES:
-            logger.info(
-                "Ignoring stale payment status payment=%s current=%s incoming=%s",
-                payment.id,
-                payment.status,
-                status,
-            )
-            return payment
-        payment.status = status
-        self.db.commit()
-        self.db.refresh(payment)
-        return payment
+            return payments[0]
+        changed = False
+        for payment in payments:
+            if payment.status in SETTLED_STATUSES and status not in SETTLED_STATUSES:
+                logger.info(
+                    "Ignoring stale payment status payment=%s current=%s incoming=%s",
+                    payment.id,
+                    payment.status,
+                    status,
+                )
+                continue
+            payment.status = status
+            changed = True
+        if changed:
+            self.db.commit()
+            self.db.refresh(payments[0])
+        return payments[0]

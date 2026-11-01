@@ -293,3 +293,29 @@ def test_making_a_second_card_the_default_unsets_the_first():
         assert service.get_default_payment_method("teacher-1").id == second.id
     finally:
         db.close()
+
+
+def test_a_charge_recorded_twice_by_a_race_settles_on_both_rows():
+    db = _db()
+    try:
+        for _ in range(2):
+            db.add(
+                Payment(
+                    tenant="practiq",
+                    gateway_payment_id="mp-1",
+                    amount=Decimal("100"),
+                    status="pending",
+                    user_id="teacher-1",
+                    external_reference="order-7",
+                )
+            )
+        db.commit()
+
+        PaymentService(db, RecordingMercadoPago(), tenant=None).update_payment_status(
+            "mp-1", "approved"
+        )
+
+        rows = db.query(Payment).order_by(Payment.id).all()
+        assert [p.status for p in rows] == ["approved", "approved"]
+    finally:
+        db.close()
