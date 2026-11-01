@@ -1,4 +1,5 @@
 from decimal import Decimal
+from types import SimpleNamespace
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -6,18 +7,21 @@ from sqlalchemy.orm import sessionmaker
 from db.models import Payment, PaymentMethod
 from db.session import Base
 from schemas.payments import PaymentCreate, PaymentPayer, PaymentWithSavedMethodCreate
+from services.payment_method_service import PaymentMethodService
 from services.payment_service import PaymentService
 
 
 class RecordingMercadoPago:
-    def __init__(self):
+    def __init__(self, statuses=None):
         self.charges = []
         self.idempotency_keys = []
+        self.statuses = list(statuses or [])
 
     def create_payment(self, data, idempotency_key=None):
         self.charges.append(data)
         self.idempotency_keys.append(idempotency_key)
-        return {"id": f"mp-{len(self.charges)}", "status": "approved"}
+        status = self.statuses.pop(0) if self.statuses else "approved"
+        return {"id": f"mp-{len(self.charges)}", "status": status}
 
     def get_customer_email(self, customer_id):
         return "saved@example.com"
@@ -216,5 +220,76 @@ def test_backfill_gives_old_rows_the_tenant_that_owns_them():
         by_user = {p.user_id: p.tenant for p in db.query(Payment).filter(Payment.amount != 100).all()}
         assert by_user == {"teacher-1": "practiq", "stranger": "default"}
         assert db.query(Payment).filter(Payment.amount == 100).one().tenant == "yego"
+    finally:
+        db.close()
+
+
+def test_a_declined_card_can_be_retried_on_the_same_order():
+    db = _db()
+    mp = RecordingMercadoPago(statuses=["rejected", "approved"])
+    try:
+        service = PaymentService(db, mp, tenant="practiq")
+        declined = service.create_payment(_card_payment("order-7"))
+        assert declined.status == "rejected"
+
+        retried = service.create_payment(_card_payment("order-7"))
+        assert retried.status == "approved"
+        assert retried.id != declined.id
+        assert mp.idempotency_keys == ["payment:practiq:order-7", "payment:practiq:order-7#2"]
+    finally:
+        db.close()
+
+
+def test_an_approved_order_is_not_charged_again_after_a_decline():
+    db = _db()
+    mp = RecordingMercadoPago(statuses=["rejected", "approved"])
+    try:
+        service = PaymentService(db, mp, tenant="practiq")
+        service.create_payment(_card_payment("order-7"))
+        approved = service.create_payment(_card_payment("order-7"))
+        again = service.create_payment(_card_payment("order-7"))
+
+        assert again.id == approved.id
+        assert len(mp.charges) == 2
+    finally:
+        db.close()
+
+
+def test_a_pending_order_is_not_charged_again_while_it_settles():
+    db = _db()
+    mp = RecordingMercadoPago(statuses=["in_process"])
+    try:
+        service = PaymentService(db, mp, tenant="practiq")
+        pending = service.create_payment(_card_payment("order-7"))
+        assert service.create_payment(_card_payment("order-7")).id == pending.id
+        assert len(mp.charges) == 1
+    finally:
+        db.close()
+
+
+def test_making_a_second_card_the_default_unsets_the_first():
+    db = _db()
+    try:
+        service = PaymentMethodService(db, tenant="practiq")
+        card = SimpleNamespace(
+            is_default=True,
+            card_token_id="token",
+            last_four_digits="4242",
+            payment_method_id="visa",
+            cardholder_name="A B",
+            expiration_month="12",
+            expiration_year="2030",
+            payer_email=None,
+            card_number=None,
+            security_code=None,
+            doc_type=None,
+            doc_number=None,
+        )
+        first = service.create_payment_method("teacher-1", card)
+        second = service.create_payment_method("teacher-1", card)
+
+        db.refresh(first)
+        assert (first.is_default, second.is_default) == (0, 1)
+        assert service.get_default_payment_method("teacher-1").id == second.id
     finally:
         db.close()

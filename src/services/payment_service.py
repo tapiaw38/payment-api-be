@@ -10,6 +10,7 @@ from schemas.payments import PaymentCreate, PaymentWithSavedMethodCreate
 logger = logging.getLogger(__name__)
 
 SETTLED_STATUSES = ("approved", "rejected", "cancelled", "refunded", "charged_back")
+DECLINED_STATUSES = ("rejected", "cancelled")
 
 
 class PaymentService:
@@ -28,15 +29,27 @@ class PaymentService:
             return query
         return query.filter(Payment.tenant == self.tenant)
 
+    def _attempts(self, external_reference: str | None):
+        return self._scoped(
+            self.db.query(Payment).filter(Payment.external_reference == external_reference)
+        )
+
     def _already_charged(self, external_reference: str | None) -> Payment | None:
         if not external_reference:
             return None
-        return self._scoped(
-            self.db.query(Payment).filter(Payment.external_reference == external_reference)
-        ).first()
+        last = self._attempts(external_reference).order_by(Payment.id.desc()).first()
+        if last and last.status in DECLINED_STATUSES:
+            return None
+        return last
 
-    def _idempotency_key(self, external_reference: str) -> str:
-        return f"payment:{self.tenant or 'default'}:{external_reference}"
+    def _attempt_number(self, external_reference: str | None) -> int:
+        if not external_reference:
+            return 1
+        return max(self._attempts(external_reference).count(), 1)
+
+    def _idempotency_key(self, reference: str, attempt: int) -> str:
+        key = f"payment:{self.tenant or 'default'}:{reference}"
+        return key if attempt <= 1 else f"{key}#{attempt}"
 
     def create_payment(self, data: PaymentCreate) -> Payment:
         charged = self._already_charged(data.external_reference)
@@ -55,6 +68,7 @@ class PaymentService:
         self.db.add(payment)
         self.db.flush()
         reference = data.external_reference or str(payment.id)
+        attempt = self._attempt_number(data.external_reference)
         try:
             gateway_data = GatewayPaymentCreate(
                 transaction_amount=data.transaction_amount,
@@ -66,11 +80,17 @@ class PaymentService:
                 external_reference=reference,
             )
             result = self.mp.create_payment(
-                gateway_data, idempotency_key=self._idempotency_key(reference)
+                gateway_data, idempotency_key=self._idempotency_key(reference, attempt)
             )
             payment.gateway_payment_id = str(result.get("id", ""))
             payment.status = result.get("status", "pending")
-        except MercadopagoAPIException:
+        except MercadopagoAPIException as e:
+            logger.warning(
+                "Mercado Pago payment rejected payment=%s status=%s code=%s",
+                payment.id,
+                e.status_code,
+                e.error_code or "unknown",
+            )
             self.db.rollback()
             raise
         self.db.commit()
@@ -123,6 +143,7 @@ class PaymentService:
         self.db.add(payment)
         self.db.flush()
         reference = data.external_reference or str(payment.id)
+        attempt = self._attempt_number(data.external_reference)
         try:
             # When using a saved customer card token, MP requires payer.type/id
             # but must NOT receive payment_method_id (it's inferred from the token).
@@ -143,7 +164,7 @@ class PaymentService:
                 collector_id=data.collector_id,
             )
             result = self.mp.create_payment(
-                gateway_data, idempotency_key=self._idempotency_key(reference)
+                gateway_data, idempotency_key=self._idempotency_key(reference, attempt)
             )
             payment.gateway_payment_id = str(result.get("id", ""))
             payment.status = result.get("status", "pending")
