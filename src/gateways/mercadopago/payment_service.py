@@ -67,8 +67,6 @@ class MercadopagoPaymentService:
             body["description"] = data.description
         if data.external_reference:
             body["external_reference"] = data.external_reference
-        import json as _json
-        print(f"[DEBUG] MP /payments request body: {_json.dumps(body)}", flush=True)
         return self._send_request("POST", "/payments", json_body=body, idempotency_key=idempotency_key or str(uuid.uuid4()))
 
     def get_payment(self, payment_id: int | str) -> dict[str, Any]:

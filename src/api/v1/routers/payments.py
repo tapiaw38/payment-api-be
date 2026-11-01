@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from api.v1.dependencies.subscriptions import get_db, get_mp_payment_service
 from gateways.mercadopago.exceptions import MercadopagoAPIException
@@ -11,10 +11,15 @@ router = APIRouter()
 
 
 def _service(
+    request: Request,
     db: Session = Depends(get_db),
     mp: MercadopagoPaymentService = Depends(get_mp_payment_service),
 ) -> PaymentService:
-    return PaymentService(db=db, mp_payment=mp)
+    return PaymentService(
+        db=db,
+        mp_payment=mp,
+        tenant=getattr(request.state, "tenant", "default"),
+    )
 
 
 @router.post("/", response_model=PaymentResponse)
@@ -66,9 +71,10 @@ def create_preference(
 @router.get("/{payment_id}", response_model=PaymentResponse)
 def get_payment(
     payment_id: int,
+    user_id: str = Query(...),
     service: PaymentService = Depends(_service),
 ):
-    payment = service.get_payment(payment_id)
+    payment = service.get_payment(payment_id, user_id=user_id)
     if not payment:
         raise HTTPException(status_code=404, detail="payment_not_found")
     return payment

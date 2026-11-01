@@ -83,7 +83,9 @@ def _process_event(db, topic: str, resource_id: str) -> None:
     if topic == "payment":
         payments = MercadopagoPaymentService(access_token=settings.mercadopago_access_token)
         result = payments.get_payment(resource_id)
-        PaymentService(db=db, mp_payment=payments).update_payment_status(resource_id, result.get("status", ""))
+        PaymentService(db=db, mp_payment=payments, tenant=None).update_payment_status(
+            resource_id, result.get("status", "")
+        )
         SubscriptionService(db=db, mp_subscription=subscriptions).sync_recurring_payment(result)
     elif topic == "subscription_preapproval":
         result = subscriptions.get_subscription(resource_id)

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from api.v1.dependencies.subscriptions import get_db, get_mp_payment_service
@@ -9,8 +9,8 @@ from services.payment_method_service import PaymentMethodService
 router = APIRouter()
 
 
-def _service(db: Session = Depends(get_db)) -> PaymentMethodService:
-    return PaymentMethodService(db=db)
+def _service(request: Request, db: Session = Depends(get_db)) -> PaymentMethodService:
+    return PaymentMethodService(db=db, tenant=getattr(request.state, "tenant", "default"))
 
 
 @router.post("/", response_model=PaymentMethodResponse)

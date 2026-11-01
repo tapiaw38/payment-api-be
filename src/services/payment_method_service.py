@@ -9,8 +9,14 @@ logger = logging.getLogger(__name__)
 
 
 class PaymentMethodService:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, tenant: str | None = None):
         self.db = db
+        self.tenant = tenant
+
+    def _scoped(self, query):
+        if self.tenant is None:
+            return query
+        return query.filter(PaymentMethod.tenant == self.tenant)
 
     def create_payment_method(self, user_id: str, data, mp_payment_service=None) -> PaymentMethod:
         if data.is_default:
@@ -35,7 +41,7 @@ class PaymentMethodService:
                     token_for_customer = mp_payment_service.create_card_token(token_data)
                     logger.info("Created server-side card token for customer card saving")
                 mp_customer_id = mp_payment_service.get_or_create_customer(data.payer_email)
-                logger.info("MP customer_id: %s, saving token: %s", mp_customer_id, token_for_customer)
+                logger.info("MP customer resolved customer_id=%s", mp_customer_id)
                 mp_card_id = mp_payment_service.save_card_to_customer(mp_customer_id, token_for_customer)
                 logger.info("MP card saved: %s", mp_card_id)
             except Exception as e:
@@ -46,6 +52,7 @@ class PaymentMethodService:
                 mp_card_id = None
 
         payment_method = PaymentMethod(
+            tenant=self.tenant or "default",
             user_id=user_id,
             gateway="mercadopago",
             card_token_id=data.card_token_id,
@@ -65,25 +72,24 @@ class PaymentMethodService:
 
     def get_payment_methods_by_user(self, user_id: str) -> list[PaymentMethod]:
         return (
-            self.db.query(PaymentMethod)
-            .filter(PaymentMethod.user_id == user_id)
+            self._scoped(self.db.query(PaymentMethod).filter(PaymentMethod.user_id == user_id))
             .order_by(PaymentMethod.is_default.desc(), PaymentMethod.created_at.desc())
             .all()
         )
 
     def get_default_payment_method(self, user_id: str) -> PaymentMethod | None:
-        return (
-            self.db.query(PaymentMethod)
-            .filter(PaymentMethod.user_id == user_id, PaymentMethod.is_default == 1)
-            .first()
-        )
+        return self._scoped(
+            self.db.query(PaymentMethod).filter(
+                PaymentMethod.user_id == user_id, PaymentMethod.is_default == 1
+            )
+        ).first()
 
     def get_payment_method(self, payment_method_id: int, user_id: str) -> PaymentMethod | None:
-        return (
-            self.db.query(PaymentMethod)
-            .filter(PaymentMethod.id == payment_method_id, PaymentMethod.user_id == user_id)
-            .first()
-        )
+        return self._scoped(
+            self.db.query(PaymentMethod).filter(
+                PaymentMethod.id == payment_method_id, PaymentMethod.user_id == user_id
+            )
+        ).first()
 
     def update_payment_method(self, payment_method_id: int, user_id: str, data) -> PaymentMethod | None:
         payment_method = self.get_payment_method(payment_method_id, user_id)
@@ -109,8 +115,10 @@ class PaymentMethodService:
         return True
 
     def _unset_default_for_user(self, user_id: str):
-        self.db.query(PaymentMethod).filter(
-            PaymentMethod.user_id == user_id,
-            PaymentMethod.is_default == 1
+        self._scoped(
+            self.db.query(PaymentMethod).filter(
+                PaymentMethod.user_id == user_id,
+                PaymentMethod.is_default == 1,
+            )
         ).update({"is_default": 0})
         self.db.flush()
