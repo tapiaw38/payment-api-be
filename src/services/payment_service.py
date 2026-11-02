@@ -29,30 +29,35 @@ class PaymentService:
             return query
         return query.filter(Payment.tenant == self.tenant)
 
-    def _attempts(self, external_reference: str | None):
-        return self._scoped(
-            self.db.query(Payment).filter(Payment.external_reference == external_reference)
+    def _attempts(self, external_reference: str, user_id: str) -> list[Payment]:
+        return (
+            self._scoped(
+                self.db.query(Payment).filter(
+                    Payment.external_reference == external_reference,
+                    Payment.user_id == user_id,
+                )
+            )
+            .order_by(Payment.id)
+            .all()
         )
 
-    def _already_charged(self, external_reference: str | None) -> Payment | None:
-        if not external_reference:
-            return None
-        last = self._attempts(external_reference).order_by(Payment.id.desc()).first()
-        if last and last.status in DECLINED_STATUSES:
-            return None
-        return last
+    def _already_charged(self, external_reference: str, user_id: str) -> Payment | None:
+        standing = [
+            payment
+            for payment in self._attempts(external_reference, user_id)
+            if payment.status not in DECLINED_STATUSES
+        ]
+        return standing[-1] if standing else None
 
-    def _attempt_number(self, external_reference: str | None) -> int:
-        if not external_reference:
-            return 1
-        return max(self._attempts(external_reference).count(), 1)
+    def _attempt_number(self, external_reference: str, user_id: str) -> int:
+        return max(len(self._attempts(external_reference, user_id)), 1)
 
     def _idempotency_key(self, reference: str, attempt: int) -> str:
         key = f"payment:{self.tenant or 'default'}:{reference}"
         return key if attempt <= 1 else f"{key}#{attempt}"
 
     def create_payment(self, data: PaymentCreate) -> Payment:
-        charged = self._already_charged(data.external_reference)
+        charged = self._already_charged(data.external_reference, data.user_id)
         if charged:
             return charged
         payment = Payment(
@@ -67,8 +72,8 @@ class PaymentService:
         )
         self.db.add(payment)
         self.db.flush()
-        reference = data.external_reference or str(payment.id)
-        attempt = self._attempt_number(data.external_reference)
+        reference = data.external_reference
+        attempt = self._attempt_number(reference, data.user_id)
         try:
             gateway_data = GatewayPaymentCreate(
                 transaction_amount=data.transaction_amount,
@@ -98,7 +103,7 @@ class PaymentService:
         return payment
 
     def create_payment_with_saved_method(self, data: PaymentWithSavedMethodCreate) -> Payment:
-        charged = self._already_charged(data.external_reference)
+        charged = self._already_charged(data.external_reference, data.user_id)
         if charged:
             return charged
 
@@ -142,8 +147,8 @@ class PaymentService:
         )
         self.db.add(payment)
         self.db.flush()
-        reference = data.external_reference or str(payment.id)
-        attempt = self._attempt_number(data.external_reference)
+        reference = data.external_reference
+        attempt = self._attempt_number(reference, data.user_id)
         try:
             # When using a saved customer card token, MP requires payer.type/id
             # but must NOT receive payment_method_id (it's inferred from the token).
@@ -234,19 +239,19 @@ class PaymentService:
             return None
         if not status:
             return payments[0]
-        changed = False
-        for payment in payments:
-            if payment.status in SETTLED_STATUSES and status not in SETTLED_STATUSES:
-                logger.info(
-                    "Ignoring stale payment status payment=%s current=%s incoming=%s",
-                    payment.id,
-                    payment.status,
-                    status,
-                )
-                continue
-            payment.status = status
-            changed = True
-        if changed:
-            self.db.commit()
-            self.db.refresh(payments[0])
-        return payments[0]
+        update = self._scoped(
+            self.db.query(Payment).filter(Payment.gateway_payment_id == gateway_payment_id)
+        )
+        if status not in SETTLED_STATUSES:
+            update = update.filter(Payment.status.notin_(SETTLED_STATUSES))
+        applied = update.update({Payment.status: status}, synchronize_session=False)
+        self.db.commit()
+        if applied < len(payments):
+            logger.info(
+                "Ignored stale payment status gateway_payment=%s incoming=%s rows=%s applied=%s",
+                gateway_payment_id,
+                status,
+                len(payments),
+                applied,
+            )
+        return self._rows_for_gateway_payment(gateway_payment_id)[0]

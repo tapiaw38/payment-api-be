@@ -1,6 +1,8 @@
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
@@ -36,14 +38,14 @@ def _db():
     return sessionmaker(bind=engine)()
 
 
-def _card_payment(reference: str | None) -> PaymentCreate:
+def _card_payment(reference: str, user_id: str = "teacher-1", amount: float = 2500.0) -> PaymentCreate:
     return PaymentCreate(
-        transaction_amount=2500.0,
+        transaction_amount=amount,
         token="card-token",
         payment_method_id="visa",
-        payer=PaymentPayer(email="teacher@example.com"),
+        payer=PaymentPayer(email=f"{user_id}@example.com"),
         external_reference=reference,
-        user_id="teacher-1",
+        user_id=user_id,
     )
 
 
@@ -72,14 +74,24 @@ def test_a_charge_carries_an_idempotency_key_the_gateway_can_collapse():
         db.close()
 
 
-def test_a_payment_without_a_reference_still_sends_a_stable_key():
-    db = _db()
-    mp = RecordingMercadoPago()
-    try:
-        payment = PaymentService(db, mp, tenant="practiq").create_payment(_card_payment(None))
-        assert mp.idempotency_keys == [f"payment:practiq:{payment.id}"]
-    finally:
-        db.close()
+@pytest.mark.parametrize(
+    "missing",
+    [
+        {},
+        {"external_reference": "", "user_id": "teacher-1"},
+        {"external_reference": "   ", "user_id": "teacher-1"},
+        {"external_reference": "order-7", "user_id": ""},
+    ],
+)
+def test_a_payment_without_a_usable_reference_is_refused_by_the_schema(missing):
+    with pytest.raises(ValidationError):
+        PaymentCreate(
+            transaction_amount=2500.0,
+            token="card-token",
+            payment_method_id="visa",
+            payer=PaymentPayer(email="teacher@example.com"),
+            **missing,
+        )
 
 
 def test_a_product_cannot_read_another_products_payments():
@@ -140,6 +152,7 @@ def test_a_saved_card_belonging_to_another_product_is_not_chargeable():
                     transaction_amount=2500.0,
                     payment_method_id=card.id,
                     payer=PaymentPayer(email="teacher@example.com"),
+                    external_reference="order-7",
                     user_id="teacher-1",
                 )
             )
@@ -189,10 +202,10 @@ def test_amounts_are_stored_to_the_cent():
         db.close()
 
 
-def test_backfill_gives_old_rows_the_tenant_that_owns_them():
+def test_the_backfill_only_renames_rows_when_the_deployment_names_one_tenant():
     import importlib.util
 
-    from db.models import Plan, Subscription
+    from config.settings import settings
 
     spec = importlib.util.spec_from_file_location(
         "m011", "alembic/versions/011_backfill_payment_tenant.py"
@@ -200,28 +213,18 @@ def test_backfill_gives_old_rows_the_tenant_that_owns_them():
     m011 = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m011)
 
-    db = _db()
+    original = (settings.api_keys_raw, settings.api_key)
     try:
-        plan = Plan(tenant="practiq", name="Practiq", amount=Decimal("2500"), interval="month")
-        db.add(plan)
-        db.flush()
-        db.add(
-            Subscription(tenant="practiq", plan_id=plan.id, user_id="teacher-1", status="authorized")
-        )
-        db.add(Payment(tenant="default", amount=Decimal("2500"), status="approved", user_id="teacher-1"))
-        db.add(Payment(tenant="default", amount=Decimal("900"), status="approved", user_id="stranger"))
-        db.add(Payment(tenant="yego", amount=Decimal("100"), status="approved", user_id="teacher-1"))
-        db.commit()
+        settings.api_keys_raw, settings.api_key = "", "legacy-key"
+        assert m011.target_tenant() is None
 
-        for table in ("payments", "payment_methods"):
-            db.execute(text(m011.SQLITE_BACKFILL.format(table=table)))
-        db.commit()
+        settings.api_keys_raw, settings.api_key = "practiq:k1", ""
+        assert m011.target_tenant() == "practiq"
 
-        by_user = {p.user_id: p.tenant for p in db.query(Payment).filter(Payment.amount != 100).all()}
-        assert by_user == {"teacher-1": "practiq", "stranger": "default"}
-        assert db.query(Payment).filter(Payment.amount == 100).one().tenant == "yego"
+        settings.api_keys_raw, settings.api_key = "practiq:k1,yego:k2", ""
+        assert m011.target_tenant() is None
     finally:
-        db.close()
+        settings.api_keys_raw, settings.api_key = original
 
 
 def test_a_declined_card_can_be_retried_on_the_same_order():
@@ -317,5 +320,60 @@ def test_a_charge_recorded_twice_by_a_race_settles_on_both_rows():
 
         rows = db.query(Payment).order_by(Payment.id).all()
         assert [p.status for p in rows] == ["approved", "approved"]
+    finally:
+        db.close()
+
+
+def test_two_users_reusing_a_reference_get_their_own_payment():
+    db = _db()
+    mp = RecordingMercadoPago()
+    try:
+        service = PaymentService(db, mp, tenant="practiq")
+        ana = service.create_payment(_card_payment("order-7", "ana", 5000.0))
+        beto = service.create_payment(_card_payment("order-7", "beto", 300.0))
+
+        assert beto.id != ana.id
+        assert (beto.user_id, Decimal(str(beto.amount))) == ("beto", Decimal("300.00"))
+        assert len(mp.charges) == 2
+    finally:
+        db.close()
+
+
+def test_an_approved_order_is_not_recharged_after_a_later_decline():
+    db = _db()
+    mp = RecordingMercadoPago()
+    try:
+        for status in ("approved", "rejected"):
+            db.add(
+                Payment(
+                    tenant="practiq",
+                    gateway_payment_id=f"mp-{status}",
+                    amount=Decimal("2500"),
+                    status=status,
+                    user_id="teacher-1",
+                    external_reference="order-7",
+                )
+            )
+        db.commit()
+
+        settled = PaymentService(db, mp, tenant="practiq").create_payment(_card_payment("order-7"))
+        assert settled.status == "approved"
+        assert mp.charges == []
+    finally:
+        db.close()
+
+
+def test_a_settled_payment_does_not_regress_under_concurrent_webhooks():
+    db = _db()
+    mp = RecordingMercadoPago()
+    try:
+        payment = PaymentService(db, mp, tenant="practiq").create_payment(_card_payment("order-7"))
+        webhook = PaymentService(db, mp, tenant=None)
+
+        stale = db.query(Payment).filter(Payment.id == payment.id).one()
+        assert stale.status == "approved"
+        assert webhook.update_payment_status(payment.gateway_payment_id, "pending").status == "approved"
+        db.refresh(stale)
+        assert stale.status == "approved"
     finally:
         db.close()

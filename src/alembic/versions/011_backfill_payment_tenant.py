@@ -1,4 +1,4 @@
-"""give existing payments and saved cards the tenant that owns them
+"""give existing payments and saved cards the tenant this deployment serves
 
 Revision ID: 011
 Revises: 010
@@ -7,44 +7,32 @@ Revises: 010
 from alembic import op
 import sqlalchemy as sa
 
+from config.settings import settings
+
 revision = "011"
 down_revision = "010"
 branch_labels = None
 depends_on = None
 
 
-BACKFILL = """
-UPDATE {table} AS t
-SET tenant = s.tenant
-FROM (
-    SELECT DISTINCT ON (user_id) user_id, tenant
-    FROM subscriptions
-    ORDER BY user_id, created_at DESC
-) AS s
-WHERE t.user_id = s.user_id
-  AND t.tenant = 'default'
-  AND s.tenant <> 'default'
-"""
-
-SQLITE_BACKFILL = """
-UPDATE {table}
-SET tenant = (
-    SELECT s.tenant FROM subscriptions s
-    WHERE s.user_id = {table}.user_id
-    ORDER BY s.created_at DESC LIMIT 1
-)
-WHERE tenant = 'default'
-  AND EXISTS (
-      SELECT 1 FROM subscriptions s
-      WHERE s.user_id = {table}.user_id AND s.tenant <> 'default'
-  )
-"""
+def target_tenant() -> str | None:
+    tenants = set(settings.tenant_by_api_key.values())
+    if len(tenants) != 1:
+        return None
+    tenant = tenants.pop()
+    return None if tenant == "default" else tenant
 
 
 def upgrade() -> None:
-    statement = SQLITE_BACKFILL if op.get_bind().dialect.name == "sqlite" else BACKFILL
+    tenant = target_tenant()
+    if not tenant:
+        return
     for table in ("payments", "payment_methods"):
-        op.execute(sa.text(statement.format(table=table)))
+        op.execute(
+            sa.text(f"UPDATE {table} SET tenant = :tenant WHERE tenant = 'default'").bindparams(
+                tenant=tenant
+            )
+        )
 
 
 def downgrade() -> None:
