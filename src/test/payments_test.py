@@ -9,7 +9,14 @@ from sqlalchemy.orm import sessionmaker
 
 from db.models import Payment, PaymentMethod
 from db.session import Base
-from schemas.payments import PaymentCreate, PaymentPayer, PaymentWithSavedMethodCreate
+from schemas.payments import (
+    PaymentCreate,
+    PaymentPayer,
+    PaymentWithSavedMethodCreate,
+    PreferenceBackUrls,
+    PreferenceCreate,
+    PreferenceItem,
+)
 from services.payment_method_service import PaymentMethodService
 from services.payment_service import PaymentService
 
@@ -475,5 +482,106 @@ def test_a_racing_request_concedes_to_the_reservation_without_charging():
 
         assert service.create_payment(_card_payment("order-7")).id == winner.id
         assert len(mp.charges) == 1
+    finally:
+        db.close()
+
+
+class PreferenceMercadoPago(RecordingMercadoPago):
+    def create_preference(self, items, payer_email, external_reference, back_urls, notification_url=None):
+        self.charges.append(items)
+        return {"id": "pref-1", "init_point": "https://mp/checkout", "sandbox_init_point": ""}
+
+
+def _preference(reference: str = "order-7", user_id: str = "teacher-1", unit_price: float = 1250.0):
+    return PreferenceCreate(
+        items=[PreferenceItem(title="Plan", quantity=2, unit_price=unit_price)],
+        payer_email=f"{user_id}@example.com",
+        external_reference=reference,
+        user_id=user_id,
+        back_urls=PreferenceBackUrls(success="https://x/ok", failure="https://x/no", pending="https://x/wait"),
+    )
+
+
+def test_a_checkout_pro_preference_opens_a_payment_row():
+    db = _db()
+    mp = PreferenceMercadoPago()
+    try:
+        answer = PaymentService(db, mp, tenant="practiq").create_preference(_preference())
+
+        row = db.query(Payment).one()
+        assert answer["payment_id"] == row.id
+        assert (row.status, row.user_id, row.tenant) == ("pending", "teacher-1", "practiq")
+        assert Decimal(str(row.amount)) == Decimal("2500.00")
+        assert row.gateway_payment_id is None
+    finally:
+        db.close()
+
+
+def test_the_webhook_binds_a_checkout_pro_payment_to_its_preference():
+    db = _db()
+    mp = PreferenceMercadoPago()
+    try:
+        PaymentService(db, mp, tenant="practiq").create_preference(_preference())
+
+        bound = PaymentService(db, mp, tenant=None).record_gateway_payment(
+            {
+                "id": "mp-77",
+                "status": "approved",
+                "external_reference": "order-7",
+                "transaction_amount": 2500.0,
+            }
+        )
+
+        assert bound is not None
+        assert (bound.gateway_payment_id, bound.status) == ("mp-77", "approved")
+        assert db.query(Payment).count() == 1
+    finally:
+        db.close()
+
+
+def test_a_checkout_pro_payment_for_another_amount_is_not_bound():
+    db = _db()
+    mp = PreferenceMercadoPago()
+    try:
+        PaymentService(db, mp, tenant="practiq").create_preference(_preference())
+
+        assert (
+            PaymentService(db, mp, tenant=None).record_gateway_payment(
+                {
+                    "id": "mp-77",
+                    "status": "approved",
+                    "external_reference": "order-7",
+                    "transaction_amount": 99.0,
+                }
+            )
+            is None
+        )
+        assert db.query(Payment).one().gateway_payment_id is None
+    finally:
+        db.close()
+
+
+def test_rebuilding_a_preference_reuses_the_row_it_already_opened():
+    db = _db()
+    mp = PreferenceMercadoPago()
+    try:
+        service = PaymentService(db, mp, tenant="practiq")
+        first = service.create_preference(_preference())
+        again = service.create_preference(_preference())
+
+        assert again["payment_id"] == first["payment_id"]
+        assert db.query(Payment).count() == 1
+    finally:
+        db.close()
+
+
+def test_a_preference_for_a_reference_owned_by_another_payer_is_refused():
+    db = _db()
+    mp = PreferenceMercadoPago()
+    try:
+        service = PaymentService(db, mp, tenant="practiq")
+        service.create_preference(_preference(user_id="ana"))
+        with pytest.raises(ValueError, match="payment_reference_conflict"):
+            service.create_preference(_preference(user_id="beto"))
     finally:
         db.close()

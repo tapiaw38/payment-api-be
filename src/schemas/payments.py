@@ -48,7 +48,8 @@ class PreferenceBackUrls(BaseModel):
 class PreferenceCreate(BaseModel):
     items: list[PreferenceItem]
     payer_email: str
-    external_reference: str
+    external_reference: Identifier
+    user_id: Identifier
     back_urls: PreferenceBackUrls
     notification_url: str | None = None
 
@@ -57,6 +58,7 @@ class PreferenceResponse(BaseModel):
     preference_id: str
     init_point: str
     sandbox_init_point: str
+    payment_id: int | None = None
 
 
 class PaymentResponse(BaseModel):

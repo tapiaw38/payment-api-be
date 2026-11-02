@@ -1,5 +1,5 @@
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -73,7 +73,7 @@ class PaymentService:
             status="pending",
             user_id=data.user_id,
             external_reference=data.external_reference,
-            description=data.description,
+            description=getattr(data, "description", None),
         )
         self.db.add(payment)
         try:
@@ -205,12 +205,30 @@ class PaymentService:
         self.db.refresh(payment)
         return payment
 
+    @staticmethod
+    def preference_total(items) -> Decimal:
+        total = sum(
+            (Decimal(str(item.unit_price)) * Decimal(item.quantity) for item in items),
+            Decimal("0"),
+        )
+        return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
     def create_preference(self, data) -> dict:
+        total = self.preference_total(data.items)
+        opened = self._already_charged(data.external_reference, data.user_id, total)
+        payment = None
+        if not opened:
+            payment, conceded = self._reserve(data, total)
+            if payment is None:
+                if conceded is None:
+                    raise ValueError("payment_reference_conflict")
+                opened = conceded
+
         items = [
             {
                 "title": item.title,
                 "quantity": item.quantity,
-                "unit_price": round(item.unit_price, 2),
+                "unit_price": float(Decimal(str(item.unit_price)).quantize(Decimal("0.01"))),
                 "currency_id": item.currency_id,
             }
             for item in data.items
@@ -220,18 +238,61 @@ class PaymentService:
             "failure": data.back_urls.failure,
             "pending": data.back_urls.pending,
         }
-        result = self.mp.create_preference(
-            items=items,
-            payer_email=data.payer_email,
-            external_reference=data.external_reference,
-            back_urls=back_urls,
-            notification_url=data.notification_url,
-        )
+        try:
+            result = self.mp.create_preference(
+                items=items,
+                payer_email=data.payer_email,
+                external_reference=data.external_reference,
+                back_urls=back_urls,
+                notification_url=data.notification_url,
+            )
+        except MercadopagoAPIException:
+            self.db.rollback()
+            raise
+        self.db.commit()
         return {
             "preference_id": result.get("id", ""),
             "init_point": result.get("init_point", ""),
             "sandbox_init_point": result.get("sandbox_init_point", ""),
+            "payment_id": (payment or opened).id if (payment or opened) else None,
         }
+
+    def record_gateway_payment(self, provider_data: dict) -> Payment | None:
+        gateway_payment_id = str(provider_data.get("id") or "")
+        if not gateway_payment_id:
+            return None
+        status = provider_data.get("status") or ""
+        bound = self.update_payment_status(gateway_payment_id, status)
+        if bound:
+            return bound
+        reference = provider_data.get("external_reference")
+        if not reference:
+            return None
+        waiting = [
+            payment
+            for payment in self._attempts(reference)
+            if not payment.gateway_payment_id and payment.status not in DECLINED_STATUSES
+        ]
+        if not waiting:
+            return None
+        payment = waiting[-1]
+        charged = provider_data.get("transaction_amount")
+        if charged is not None and self._cents(charged) != self._cents(payment.amount):
+            logger.warning(
+                "Gateway payment amount does not match the reference it names"
+                " gateway_payment=%s reference=%s expected=%s charged=%s",
+                gateway_payment_id,
+                reference,
+                payment.amount,
+                charged,
+            )
+            return None
+        payment.gateway_payment_id = gateway_payment_id
+        if status:
+            payment.status = status
+        self.db.commit()
+        self.db.refresh(payment)
+        return payment
 
     def get_payment(self, payment_id: int, user_id: str | None = None) -> Payment | None:
         query = self._scoped(self.db.query(Payment).filter(Payment.id == payment_id))

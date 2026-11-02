@@ -64,6 +64,8 @@ def create_preference(
 ):
     try:
         return service.create_preference(data)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except MercadopagoAPIException as e:
         raise HTTPException(
             status_code=e.status_code,
