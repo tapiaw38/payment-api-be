@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from db.models import Payment, PaymentMethod
@@ -307,10 +308,10 @@ def test_making_a_second_card_the_default_unsets_the_first():
         db.close()
 
 
-def test_a_charge_recorded_twice_by_a_race_settles_on_both_rows():
+def test_every_row_of_one_charge_settles_together():
     db = _db()
     try:
-        for _ in range(2):
+        for reference in ("order-7", "order-7-retry"):
             db.add(
                 Payment(
                     tenant="practiq",
@@ -318,7 +319,7 @@ def test_a_charge_recorded_twice_by_a_race_settles_on_both_rows():
                     amount=Decimal("100"),
                     status="pending",
                     user_id="teacher-1",
-                    external_reference="order-7",
+                    external_reference=reference,
                 )
             )
         db.commit()
@@ -327,8 +328,10 @@ def test_a_charge_recorded_twice_by_a_race_settles_on_both_rows():
             "mp-1", "approved"
         )
 
-        rows = db.query(Payment).order_by(Payment.id).all()
-        assert [p.status for p in rows] == ["approved", "approved"]
+        assert [p.status for p in db.query(Payment).order_by(Payment.id).all()] == [
+            "approved",
+            "approved",
+        ]
     finally:
         db.close()
 
@@ -398,5 +401,79 @@ def test_a_settled_payment_does_not_regress_under_concurrent_webhooks():
         assert webhook.update_payment_status(payment.gateway_payment_id, "pending").status == "approved"
         db.refresh(stale)
         assert stale.status == "approved"
+    finally:
+        db.close()
+
+
+def test_the_database_allows_only_one_live_payment_per_reference():
+    db = _db()
+    try:
+        for _ in range(2):
+            db.add(
+                Payment(
+                    tenant="practiq",
+                    amount=Decimal("100"),
+                    status="pending",
+                    user_id="teacher-1",
+                    external_reference="order-7",
+                )
+            )
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+    finally:
+        db.close()
+
+
+def test_a_rejected_payment_leaves_the_reference_free():
+    db = _db()
+    try:
+        db.add(
+            Payment(
+                tenant="practiq",
+                amount=Decimal("100"),
+                status="rejected",
+                user_id="teacher-1",
+                external_reference="order-7",
+            )
+        )
+        db.commit()
+        db.add(
+            Payment(
+                tenant="practiq",
+                amount=Decimal("100"),
+                status="pending",
+                user_id="teacher-1",
+                external_reference="order-7",
+            )
+        )
+        db.commit()
+        assert db.query(Payment).count() == 2
+    finally:
+        db.close()
+
+
+def test_a_racing_request_concedes_to_the_reservation_without_charging():
+    db = _db()
+    mp = RecordingMercadoPago()
+    try:
+        service = PaymentService(db, mp, tenant="practiq")
+        winner = service.create_payment(_card_payment("order-7"))
+
+        db.add(
+            Payment(
+                tenant="practiq",
+                amount=Decimal("2500"),
+                status="pending",
+                user_id="teacher-1",
+                external_reference="order-7",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db.flush()
+        db.rollback()
+
+        assert service.create_payment(_card_payment("order-7")).id == winner.id
+        assert len(mp.charges) == 1
     finally:
         db.close()

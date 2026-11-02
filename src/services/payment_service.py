@@ -1,6 +1,7 @@
 import logging
 from decimal import Decimal
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from db.models import Payment, PaymentMethod
@@ -63,16 +64,11 @@ class PaymentService:
         key = f"payment:{self.tenant or 'default'}:{reference}"
         return key if attempt <= 1 else f"{key}#{attempt}"
 
-    def create_payment(self, data: PaymentCreate) -> Payment:
-        charged = self._already_charged(
-            data.external_reference, data.user_id, data.transaction_amount
-        )
-        if charged:
-            return charged
+    def _reserve(self, data, amount) -> tuple[Payment | None, Payment | None]:
         payment = Payment(
             tenant=self.tenant or "default",
             gateway="mercadopago",
-            amount=data.transaction_amount,
+            amount=amount,
             currency="ARS",
             status="pending",
             user_id=data.user_id,
@@ -80,7 +76,26 @@ class PaymentService:
             description=data.description,
         )
         self.db.add(payment)
-        self.db.flush()
+        try:
+            self.db.flush()
+        except IntegrityError:
+            self.db.rollback()
+            return None, self._already_charged(
+                data.external_reference, data.user_id, amount
+            )
+        return payment, None
+
+    def create_payment(self, data: PaymentCreate) -> Payment:
+        charged = self._already_charged(
+            data.external_reference, data.user_id, data.transaction_amount
+        )
+        if charged:
+            return charged
+        payment, conceded = self._reserve(data, data.transaction_amount)
+        if payment is None:
+            if conceded is None:
+                raise ValueError("payment_reference_conflict")
+            return conceded
         reference = data.external_reference
         attempt = self._attempt_number(reference)
         try:
@@ -146,18 +161,11 @@ class PaymentService:
         else:
             fresh_token = payment_method.card_token_id
 
-        payment = Payment(
-            tenant=self.tenant or "default",
-            gateway="mercadopago",
-            amount=data.transaction_amount,
-            currency="ARS",
-            status="pending",
-            user_id=data.user_id,
-            external_reference=data.external_reference,
-            description=data.description,
-        )
-        self.db.add(payment)
-        self.db.flush()
+        payment, conceded = self._reserve(data, data.transaction_amount)
+        if payment is None:
+            if conceded is None:
+                raise ValueError("payment_reference_conflict")
+            return conceded
         reference = data.external_reference
         attempt = self._attempt_number(reference)
         try:

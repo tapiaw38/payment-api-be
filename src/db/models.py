@@ -71,6 +71,20 @@ class Subscription(Base):
 
 class Payment(Base):
     __tablename__ = "payments"
+    __table_args__ = (
+        Index(
+            "uq_payments_live_per_reference",
+            "tenant",
+            "external_reference",
+            unique=True,
+            postgresql_where=text(
+                "external_reference IS NOT NULL AND status NOT IN ('rejected', 'cancelled')"
+            ),
+            sqlite_where=text(
+                "external_reference IS NOT NULL AND status NOT IN ('rejected', 'cancelled')"
+            ),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     tenant = Column(String(64), nullable=False, index=True, server_default="default")
