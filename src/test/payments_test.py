@@ -18,12 +18,21 @@ class RecordingMercadoPago:
         self.charges = []
         self.idempotency_keys = []
         self.statuses = list(statuses or [])
+        self.by_key = {}
 
     def create_payment(self, data, idempotency_key=None):
+        if idempotency_key in self.by_key:
+            return self.by_key[idempotency_key]
         self.charges.append(data)
         self.idempotency_keys.append(idempotency_key)
         status = self.statuses.pop(0) if self.statuses else "approved"
-        return {"id": f"mp-{len(self.charges)}", "status": status}
+        answer = {
+            "id": f"mp-{len(self.charges)}",
+            "status": status,
+            "transaction_amount": data.transaction_amount,
+        }
+        self.by_key[idempotency_key] = answer
+        return answer
 
     def get_customer_email(self, customer_id):
         return "saved@example.com"
@@ -324,17 +333,31 @@ def test_a_charge_recorded_twice_by_a_race_settles_on_both_rows():
         db.close()
 
 
-def test_two_users_reusing_a_reference_get_their_own_payment():
+def test_a_reference_belongs_to_one_payer():
     db = _db()
     mp = RecordingMercadoPago()
     try:
         service = PaymentService(db, mp, tenant="practiq")
-        ana = service.create_payment(_card_payment("order-7", "ana", 5000.0))
-        beto = service.create_payment(_card_payment("order-7", "beto", 300.0))
+        service.create_payment(_card_payment("order-7", "ana", 5000.0))
 
-        assert beto.id != ana.id
-        assert (beto.user_id, Decimal(str(beto.amount))) == ("beto", Decimal("300.00"))
-        assert len(mp.charges) == 2
+        with pytest.raises(ValueError, match="payment_reference_conflict"):
+            service.create_payment(_card_payment("order-7", "beto", 300.0))
+        assert len(mp.charges) == 1
+        assert db.query(Payment).count() == 1
+    finally:
+        db.close()
+
+
+def test_a_reference_belongs_to_one_amount():
+    db = _db()
+    mp = RecordingMercadoPago()
+    try:
+        service = PaymentService(db, mp, tenant="practiq")
+        service.create_payment(_card_payment("order-9", "ana", 100.0))
+
+        with pytest.raises(ValueError, match="payment_reference_conflict"):
+            service.create_payment(_card_payment("order-9", "ana", 120.0))
+        assert len(mp.charges) == 1
     finally:
         db.close()
 

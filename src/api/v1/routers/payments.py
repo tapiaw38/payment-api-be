@@ -30,6 +30,8 @@ def create_payment(
     try:
         payment = service.create_payment(data)
         return payment
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except MercadopagoAPIException as e:
         raise HTTPException(
             status_code=e.status_code,
@@ -46,7 +48,8 @@ def create_payment_with_saved_method(
         payment = service.create_payment_with_saved_method(data)
         return payment
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        status = 409 if str(e) == "payment_reference_conflict" else 400
+        raise HTTPException(status_code=status, detail=str(e))
     except MercadopagoAPIException as e:
         raise HTTPException(
             status_code=e.status_code,

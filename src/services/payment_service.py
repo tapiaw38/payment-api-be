@@ -1,4 +1,6 @@
 import logging
+from decimal import Decimal
+
 from sqlalchemy.orm import Session
 
 from db.models import Payment, PaymentMethod
@@ -29,35 +31,42 @@ class PaymentService:
             return query
         return query.filter(Payment.tenant == self.tenant)
 
-    def _attempts(self, external_reference: str, user_id: str) -> list[Payment]:
+    @staticmethod
+    def _cents(amount) -> Decimal:
+        return Decimal(str(amount)).quantize(Decimal("0.01"))
+
+    def _attempts(self, external_reference: str) -> list[Payment]:
         return (
             self._scoped(
-                self.db.query(Payment).filter(
-                    Payment.external_reference == external_reference,
-                    Payment.user_id == user_id,
-                )
+                self.db.query(Payment).filter(Payment.external_reference == external_reference)
             )
             .order_by(Payment.id)
             .all()
         )
 
-    def _already_charged(self, external_reference: str, user_id: str) -> Payment | None:
+    def _already_charged(self, external_reference: str, user_id: str, amount) -> Payment | None:
+        attempts = self._attempts(external_reference)
+        if not attempts:
+            return None
+        opened = attempts[0]
+        if opened.user_id != user_id or self._cents(opened.amount) != self._cents(amount):
+            raise ValueError("payment_reference_conflict")
         standing = [
-            payment
-            for payment in self._attempts(external_reference, user_id)
-            if payment.status not in DECLINED_STATUSES
+            payment for payment in attempts if payment.status not in DECLINED_STATUSES
         ]
         return standing[-1] if standing else None
 
-    def _attempt_number(self, external_reference: str, user_id: str) -> int:
-        return max(len(self._attempts(external_reference, user_id)), 1)
+    def _attempt_number(self, external_reference: str) -> int:
+        return max(len(self._attempts(external_reference)), 1)
 
     def _idempotency_key(self, reference: str, attempt: int) -> str:
         key = f"payment:{self.tenant or 'default'}:{reference}"
         return key if attempt <= 1 else f"{key}#{attempt}"
 
     def create_payment(self, data: PaymentCreate) -> Payment:
-        charged = self._already_charged(data.external_reference, data.user_id)
+        charged = self._already_charged(
+            data.external_reference, data.user_id, data.transaction_amount
+        )
         if charged:
             return charged
         payment = Payment(
@@ -73,7 +82,7 @@ class PaymentService:
         self.db.add(payment)
         self.db.flush()
         reference = data.external_reference
-        attempt = self._attempt_number(reference, data.user_id)
+        attempt = self._attempt_number(reference)
         try:
             gateway_data = GatewayPaymentCreate(
                 transaction_amount=data.transaction_amount,
@@ -103,7 +112,9 @@ class PaymentService:
         return payment
 
     def create_payment_with_saved_method(self, data: PaymentWithSavedMethodCreate) -> Payment:
-        charged = self._already_charged(data.external_reference, data.user_id)
+        charged = self._already_charged(
+            data.external_reference, data.user_id, data.transaction_amount
+        )
         if charged:
             return charged
 
@@ -148,7 +159,7 @@ class PaymentService:
         self.db.add(payment)
         self.db.flush()
         reference = data.external_reference
-        attempt = self._attempt_number(reference, data.user_id)
+        attempt = self._attempt_number(reference)
         try:
             # When using a saved customer card token, MP requires payer.type/id
             # but must NOT receive payment_method_id (it's inferred from the token).
